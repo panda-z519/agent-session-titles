@@ -1,15 +1,22 @@
 # Agent Session Titles（会话标题自动更新）
 
-为 **Codex** 和 **Claude Code** 的本地会话维护中文三段式标题：
+为 **Codex** 和 **Claude Code** 的本地会话维护可选中文或英文的三段式标题：
 
 ```text
 状态｜初始需求｜当前进展
 开发中｜会话标题自动化｜适配双端安装器
+Building | Session titles | Add bilingual support
 ```
 
 中间段保留用户最初要解决的问题；状态和末段随工作变化。当前支持的状态为「摸底、方案、开发中、测试、修复、待确认、已完成、搁置」。工作树会自动加上 `[工作树] ` 前缀，无项目会话不加目录名。名称来源不明时，钩子保留现有名称。
 
-## 安装
+## 直接交给 Agent 安装
+
+把下面这段话直接发给**有本机终端权限的 Codex 或 Claude Code Agent**。将“中文”改为“英文”即可选择英文；也可以将“两个客户端”改为“仅 Codex”或“仅 Claude Code”。Agent 会执行安装命令和检查步骤，你不需要自己打开终端。完整的中英文可复制版本见 [Agent 安装说明](AGENT_INSTALL.md)。
+
+> 请从 https://github.com/panda-z519/agent-session-titles 安装本地会话标题插件，目标是两个客户端，标题使用中文。先检查本机 `codex`、`claude`、Node.js 20+ 和 Python 3.11+。执行 `npx --yes github:panda-z519/agent-session-titles --both --lang zh --migrate`，再核对安装结果和配置备份。`--migrate` 只用于备份并迁移旧版标题钩子，保留其他钩子。若缺少客户端或安装失败，说明具体原因，不声称成功。Codex 若要求信任新钩子，请让我在应用中检查并确认；完成后提醒我重启客户端并验证新本地会话。
+
+## 自己运行命令安装
 
 需要 macOS 或 Linux、Node.js 20+、Python 3.11+，以及要使用的客户端命令 `codex` 或 `claude`。选择一条命令运行：
 
@@ -37,6 +44,17 @@ npx --yes github:panda-z519/agent-session-titles --claude
 npx --yes github:panda-z519/agent-session-titles --both
 ```
 
+默认标题语言为中文。首次安装选择英文时加 `--lang en`；之后重跑时不指定语言会保留当前选择，切回中文可用 `--lang zh`：
+
+`--lang` 控制插件钩子的标题格式、状态词和给 Agent 的提示。若你自己的全局 `AGENTS.md` 或 `CLAUDE.md` 仍强制另一种标题语言，应同步调整其中的标题规则；上面的 Agent 安装指令包含这一步。
+
+```bash
+npx --yes github:panda-z519/agent-session-titles --codex --lang en
+npx --yes github:panda-z519/agent-session-titles --claude --lang zh
+```
+
+已有旧版独立标题钩子时，加 `--migrate` 才会迁移并安装插件；不加会报错并保持旧配置。迁移只删除旧标题钩子的注册条目，保留脚本、其他钩子和会话数据，并备份原配置。
+
 安装器从 GitHub 读取此仓库，将插件文件复制到用户目录中的稳定位置，再调用相应客户端的插件命令。它不会在 `npm install` 阶段执行 `postinstall`。新安装的 Codex 钩子需要在 Codex 中检查并信任；随后重启对应客户端，使用新的本地会话验证。[Codex 钩子信任说明](https://learn.chatgpt.com/docs/hooks)
 
 ## 安装器会修改什么
@@ -46,7 +64,7 @@ npx --yes github:panda-z519/agent-session-titles --both
 | Codex | 注册并安装 `codex-session-titles` 插件；把 `~/.codex/session-titles/` 加入窄范围可写目录；更新前检查状态库结构并创建 SQLite 一致性备份。 |
 | Claude Code | 注册并安装 `claude-session-titles` 插件；在 `~/.claude/settings.json` 中加入 `Edit(~/.cc-session-titles/**)`；改动前备份已有设置。 |
 
-已安装旧版用户级 `session-title.sh` 的客户端会被**跳过**，原有钩子、配置和会话数据保留，以免同一事件运行两次。安装器会明确打印跳过原因。`CODEX_HOME` 和 `CLAUDE_CONFIG_DIR` 分别支持自定义两端配置目录。
+已安装旧版用户级 `session-title.sh` 的客户端需要明确传入 `--migrate`；安装器会备份后移除匹配的旧钩子注册，再安装插件。`CODEX_HOME` 和 `CLAUDE_CONFIG_DIR` 分别支持自定义两端配置目录。
 
 ## 验证标题
 

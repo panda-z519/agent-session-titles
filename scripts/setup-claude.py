@@ -2,6 +2,7 @@
 """为 Claude Code 插件准备用户级目录写入权限。"""
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import shutil
@@ -13,6 +14,8 @@ from typing import Any
 
 
 REQUIRED_PERMISSION = "Edit(~/.cc-session-titles/**)"
+DEFAULT_LANGUAGE = "zh"
+VALID_LANGUAGES = {"zh", "en"}
 
 
 class SetupError(RuntimeError):
@@ -33,6 +36,27 @@ def read_settings(settings_file: Path) -> dict[str, Any]:
     if not isinstance(settings, dict):
         raise SetupError(f"{settings_file} 的顶层结构必须是 JSON 对象，未作修改。")
     return settings
+
+
+def read_language_config(config_file: Path) -> dict[str, Any]:
+    if not config_file.exists():
+        return {}
+    try:
+        text = config_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise SetupError(f"无法读取 {config_file}：{exc}") from exc
+    try:
+        config = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise SetupError(f"{config_file} 不是合法 JSON，未作修改：{exc}") from exc
+    if not isinstance(config, dict):
+        raise SetupError(f"{config_file} 的顶层结构必须是 JSON 对象，未作修改。")
+    language = config.get("language")
+    if language is not None and language not in VALID_LANGUAGES:
+        raise SetupError(
+            f"{config_file} 的 language 必须是 zh 或 en，未作修改。"
+        )
+    return config
 
 
 def add_required_permission(settings: dict[str, Any]) -> bool:
@@ -100,39 +124,63 @@ def atomic_write(settings_file: Path, settings: dict[str, Any]) -> None:
         raise SetupError(f"无法安全写入 {settings_file}：{exc}") from exc
 
 
-def run() -> int:
+def run(requested_language: str | None = None) -> int:
+    if requested_language is not None and requested_language not in VALID_LANGUAGES:
+        raise SetupError("--lang 必须是 zh 或 en，未作修改。")
+
     configured_dir = os.environ.get("CLAUDE_CONFIG_DIR")
     config_dir = Path(configured_dir).expanduser() if configured_dir else Path.home() / ".claude"
     config_dir = config_dir.resolve()
     settings_file = config_dir / "settings.json"
+    configured_title_dir = os.environ.get("CC_TITLE_DIR")
+    title_dir = (
+        Path(configured_title_dir).expanduser()
+        if configured_title_dir
+        else Path.home() / ".cc-session-titles"
+    ).resolve()
+    language_config_file = title_dir / "config.json"
 
     settings = read_settings(settings_file)
-    changed = add_required_permission(settings)
-    if not changed:
-        print(f"Claude 权限已存在：{REQUIRED_PERMISSION}")
-        return 0
+    settings_changed = add_required_permission(settings)
+    language_config = read_language_config(language_config_file)
+    language = requested_language or language_config.get("language") or DEFAULT_LANGUAGE
+    language_changed = language_config.get("language") != language
+    language_config["language"] = language
 
     try:
         config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        title_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     except OSError as exc:
-        raise SetupError(f"无法创建 Claude 配置目录 {config_dir}：{exc}") from exc
+        raise SetupError(f"无法创建 Claude 配置或标题目录：{exc}") from exc
 
-    if settings_file.exists():
-        backup = next_backup_path(settings_file)
-        try:
-            shutil.copy2(settings_file, backup)
-        except OSError as exc:
-            raise SetupError(f"无法备份 {settings_file}：{exc}") from exc
-        print(f"已备份 Claude 配置：{backup}")
+    if settings_changed:
+        if settings_file.exists():
+            backup = next_backup_path(settings_file)
+            try:
+                shutil.copy2(settings_file, backup)
+            except OSError as exc:
+                raise SetupError(f"无法备份 {settings_file}：{exc}") from exc
+            print(f"已备份 Claude 配置：{backup}")
 
-    atomic_write(settings_file, settings)
-    print(f"已加入 Claude 用户权限：{REQUIRED_PERMISSION}")
+        atomic_write(settings_file, settings)
+        print(f"已加入 Claude 用户权限：{REQUIRED_PERMISSION}")
+    else:
+        print(f"Claude 权限已存在：{REQUIRED_PERMISSION}")
+
+    if language_changed:
+        atomic_write(language_config_file, language_config)
+        print(f"已设置 Claude 会话标题语言：{language}")
+    else:
+        print(f"Claude 会话标题语言已保持：{language}")
     return 0
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="准备 Claude Code 会话标题插件配置。")
+    parser.add_argument("--lang", choices=sorted(VALID_LANGUAGES), dest="language")
+    arguments = parser.parse_args()
     try:
-        return run()
+        return run(arguments.language)
     except SetupError as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 1

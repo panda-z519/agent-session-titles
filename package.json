@@ -1,7 +1,7 @@
 {
   "name": "agent-session-titles",
-  "version": "0.2.0",
-  "description": "一条 npx 命令安装 Codex 与 Claude Code 本地会话三段式标题插件",
+  "version": "0.3.0",
+  "description": "安装支持中英文的 Codex 与 Claude Code 本地会话标题插件",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -18,7 +18,11 @@
     "claude-marketplace/",
     "plugins/",
     "scripts/",
-    "使用说明.md"
+    "AGENT_INSTALL.md",
+    "README.en.md",
+    "使用说明.md",
+    "!**/__pycache__/**",
+    "!**/*.pyc"
   ],
   "engines": {
     "node": ">=20"

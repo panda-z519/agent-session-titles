@@ -13,19 +13,34 @@ from typing import Any
 
 
 VALID_EVENTS = {"SessionStart", "UserPromptSubmit"}
+DEFAULT_LANGUAGE = "zh"
 VALID_STATUSES = {
-    "摸底",
-    "方案",
-    "开发中",
-    "测试",
-    "修复",
-    "待确认",
-    "已完成",
-    "搁置",
+    "zh": {
+        "摸底",
+        "方案",
+        "开发中",
+        "测试",
+        "修复",
+        "待确认",
+        "已完成",
+        "搁置",
+    },
+    "en": {
+        "Scoping",
+        "Planning",
+        "Building",
+        "Testing",
+        "Fixing",
+        "Awaiting confirmation",
+        "Completed",
+        "Paused",
+    },
 }
+TITLE_SEPARATORS = {"zh": "｜", "en": " | "}
+WORKTREE_PREFIXES = {"zh": "[工作树] ", "en": "[worktree] "}
 SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 CONTROL_CHARACTER_PATTERN = re.compile(r"[\x00-\x1f\x7f]")
-WORKTREE_PREFIX_PATTERN = re.compile(r"^(?:\[工作树\]\s*)+")
+WORKTREE_PREFIX_PATTERN = re.compile(r"^(?:(?:\[工作树\]|\[worktree\])\s*)+")
 MAX_TITLE_LENGTH = 100
 
 
@@ -51,6 +66,17 @@ def ensure_title_directory(directory: Path) -> bool:
         return False
 
 
+def read_language(directory: Path) -> str:
+    try:
+        config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+        return DEFAULT_LANGUAGE
+    if not isinstance(config, dict):
+        return DEFAULT_LANGUAGE
+    language = config.get("language")
+    return language if language in VALID_STATUSES else DEFAULT_LANGUAGE
+
+
 def read_applied_title(path: Path) -> tuple[str, str]:
     try:
         value = path.read_text(encoding="utf-8").strip()
@@ -61,7 +87,7 @@ def read_applied_title(path: Path) -> tuple[str, str]:
     return ("ok", value) if value else ("error", "")
 
 
-def read_requested_title(path: Path) -> tuple[str, str]:
+def read_requested_title(path: Path, language: str) -> tuple[str, str]:
     try:
         content = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -73,15 +99,16 @@ def read_requested_title(path: Path) -> tuple[str, str]:
     first_line = lines[0] if lines else ""
     cleaned = CONTROL_CHARACTER_PATTERN.sub("", first_line).strip()
     cleaned = WORKTREE_PREFIX_PATTERN.sub("", cleaned).strip()
-    parts = [part.strip() for part in cleaned.split("｜")]
+    separator = TITLE_SEPARATORS[language]
+    parts = [part.strip() for part in cleaned.split(separator)]
     if (
         len(parts) != 3
         or any(not part for part in parts)
-        or parts[0] not in VALID_STATUSES
+        or parts[0] not in VALID_STATUSES[language]
         or len(cleaned) > MAX_TITLE_LENGTH
     ):
         return "invalid", ""
-    return "ok", "｜".join(parts)
+    return "ok", separator.join(parts)
 
 
 def resolve_git_path(cwd: Path, value: str) -> Path:
@@ -104,13 +131,13 @@ def git_path(cwd: Path, argument: str) -> Path | None:
     return resolve_git_path(cwd, value) if value else None
 
 
-def worktree_prefix(cwd_value: Any) -> str:
+def worktree_prefix(cwd_value: Any, language: str) -> str:
     cwd = Path(cwd_value) if isinstance(cwd_value, str) and cwd_value else Path.cwd()
     git_directory = git_path(cwd, "--git-dir")
     common_directory = git_path(cwd, "--git-common-dir")
     if git_directory is None or common_directory is None:
         return ""
-    return "[工作树] " if git_directory != common_directory else ""
+    return WORKTREE_PREFIXES[language] if git_directory != common_directory else ""
 
 
 def write_applied_title(path: Path, title: str) -> bool:
@@ -139,7 +166,17 @@ def write_applied_title(path: Path, title: str) -> bool:
         return False
 
 
-def writing_guidance(title_file: Path) -> str:
+def writing_guidance(title_file: Path, language: str) -> str:
+    if language == "en":
+        return (
+            f"Session title file: {title_file}. After the first substantive response, "
+            "and whenever the phase or topic clearly changes, use the file-writing tool "
+            "to overwrite it with one line in the form "
+            "\"Status | Initial request | Current progress\". Choose Status from "
+            "Scoping, Planning, Building, Testing, Fixing, Awaiting confirmation, "
+            "Completed, or Paused. Keep Initial request unchanged once established. "
+            "The hook adds the worktree prefix. Do not write when the title is still accurate."
+        )
     return (
         f"会话标题文件：{title_file}。"
         "第一次实质回复后，以及阶段或主题明显变化时，"
@@ -150,7 +187,13 @@ def writing_guidance(title_file: Path) -> str:
     )
 
 
-def source_unconfirmed_context(current: str, applied: str) -> str:
+def source_unconfirmed_context(current: str, applied: str, language: str) -> str:
+    if language == "en":
+        return (
+            f'The current session title "{current or "Untitled"}" differs from the title '
+            f'the hook last applied, "{applied}". The title source is unconfirmed. '
+            "Keep the current title and do not write the title file."
+        )
     return (
         f"当前会话名称「{current or '未命名'}」与钩子上次应用的名称"
         f"「{applied}」不一致，"
@@ -162,6 +205,7 @@ def process_session_start(
     payload: dict[str, Any],
     title_file: Path,
     applied_file: Path,
+    language: str,
 ) -> None:
     applied_result, applied = read_applied_title(applied_file)
     current = payload.get("session_title")
@@ -169,25 +213,28 @@ def process_session_start(
     if applied_result == "ok" and current != applied:
         emit(
             "SessionStart",
-            context=source_unconfirmed_context(current, applied),
+            context=source_unconfirmed_context(current, applied, language),
         )
         return
     if applied_result == "error":
         emit(
             "SessionStart",
             context=(
-                "标题同步基线暂时无法读取，保留现有名称，"
-                "本轮不要写标题文件。"
+                "The title synchronization baseline cannot be read right now. Keep the "
+                "current title and do not write the title file during this turn."
+                if language == "en"
+                else "标题同步基线暂时无法读取，保留现有名称，本轮不要写标题文件。"
             ),
         )
         return
-    emit("SessionStart", context=writing_guidance(title_file))
+    emit("SessionStart", context=writing_guidance(title_file, language))
 
 
 def process_user_prompt(
     payload: dict[str, Any],
     title_file: Path,
     applied_file: Path,
+    language: str,
 ) -> None:
     applied_result, applied = read_applied_title(applied_file)
     current = payload.get("session_title")
@@ -195,29 +242,33 @@ def process_user_prompt(
     if applied_result == "ok" and current != applied:
         emit(
             "UserPromptSubmit",
-            context=source_unconfirmed_context(current, applied),
+            context=source_unconfirmed_context(current, applied, language),
         )
         return
     if applied_result == "error":
         emit(
             "UserPromptSubmit",
             context=(
-                "标题同步基线暂时无法读取，保留现有名称，"
-                "本轮不要写标题文件。"
+                "The title synchronization baseline cannot be read right now. Keep the "
+                "current title and do not write the title file during this turn."
+                if language == "en"
+                else "标题同步基线暂时无法读取，保留现有名称，本轮不要写标题文件。"
             ),
         )
         return
 
-    title_result, requested = read_requested_title(title_file)
+    title_result, requested = read_requested_title(title_file, language)
     if title_result == "missing":
-        emit("UserPromptSubmit", context=writing_guidance(title_file))
+        emit("UserPromptSubmit", context=writing_guidance(title_file, language))
         return
     if title_result == "error":
         emit(
             "UserPromptSubmit",
             context=(
-                f"标题文件暂时无法读取：{title_file}。"
-                "保留现有名称，后续提示词会重试。"
+                f"The title file cannot be read right now: {title_file}. Keep the current "
+                "title; a later prompt will retry."
+                if language == "en"
+                else f"标题文件暂时无法读取：{title_file}。保留现有名称，后续提示词会重试。"
             ),
         )
         return
@@ -225,22 +276,28 @@ def process_user_prompt(
         emit(
             "UserPromptSubmit",
             context=(
-                f"标题文件内容无效：{title_file}。保留现有名称；请改为一行"
+                f"The title file is invalid: {title_file}. Keep the current title. Change "
+                "it to one line in the form \"Status | Initial request | Current progress\" "
+                "and use an allowed status."
+                if language == "en"
+                else f"标题文件内容无效：{title_file}。保留现有名称；请改为一行"
                 "「状态｜初始需求｜当前进展」，并使用规定的状态词。"
             ),
         )
         return
 
-    desired = f"{worktree_prefix(payload.get('cwd'))}{requested}"
+    desired = f"{worktree_prefix(payload.get('cwd'), language)}{requested}"
     if applied_result == "ok" and desired == applied:
-        emit("UserPromptSubmit", context=writing_guidance(title_file))
+        emit("UserPromptSubmit", context=writing_guidance(title_file, language))
         return
     if not write_applied_title(applied_file, desired):
         emit(
             "UserPromptSubmit",
             context=(
-                "标题同步基线暂时无法保存，保留现有名称，"
-                "后续提示词会重试。"
+                "The title synchronization baseline cannot be saved right now. Keep the "
+                "current title; a later prompt will retry."
+                if language == "en"
+                else "标题同步基线暂时无法保存，保留现有名称，后续提示词会重试。"
             ),
         )
         return
@@ -268,11 +325,12 @@ def main() -> int:
     if not ensure_title_directory(directory):
         emit(event, context="会话标题目录暂时无法创建，保留现有名称。")
         return 0
+    language = read_language(directory)
 
     if event == "SessionStart":
-        process_session_start(payload, title_file, applied_file)
+        process_session_start(payload, title_file, applied_file, language)
     else:
-        process_user_prompt(payload, title_file, applied_file)
+        process_user_prompt(payload, title_file, applied_file, language)
     return 0
 
 

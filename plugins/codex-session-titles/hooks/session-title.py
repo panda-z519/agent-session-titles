@@ -13,7 +13,26 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
-VALID_STATUSES = {"摸底", "方案", "开发中", "测试", "修复", "待确认", "已完成", "搁置"}
+DEFAULT_LANGUAGE = "zh"
+SUPPORTED_LANGUAGES = {"zh", "en"}
+VALID_STATUSES = {
+    "zh": {"摸底", "方案", "开发中", "测试", "修复", "待确认", "已完成", "搁置"},
+    "en": {
+        "Scoping",
+        "Planning",
+        "Building",
+        "Testing",
+        "Fixing",
+        "Awaiting confirmation",
+        "Completed",
+        "Paused",
+    },
+}
+TITLE_SEPARATORS = {"zh": "｜", "en": " | "}
+WORKTREE_PREFIXES = {"zh": "[工作树] ", "en": "[worktree] "}
+PROJECTLESS_TITLES = {"zh": "摸底｜新会话", "en": "Scoping | New session"}
+NO_BRANCH_NAMES = {"zh": "无分支", "en": "no branch"}
+WORKTREE_PREFIX_PATTERN = re.compile(r"^(?:(?:\[工作树\]|\[worktree\])\s*)+")
 SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 PHASE_INITIALIZING = "initializing"
 PHASE_MANAGED = "managed"
@@ -29,7 +48,17 @@ RESULT_INITIAL_TITLE_TIMEOUT = "initial_title_timeout"
 INITIAL_EMPTY_STOP_LIMIT = 3
 
 
-def project_context(cwd: str) -> tuple[bool, str, str, str]:
+def read_language(config_file: Path) -> str:
+    try:
+        config = json.loads(config_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return DEFAULT_LANGUAGE
+    if not isinstance(config, dict) or config.get("language") not in SUPPORTED_LANGUAGES:
+        return DEFAULT_LANGUAGE
+    return config["language"]
+
+
+def project_context(cwd: str, language: str) -> tuple[bool, str, str, str]:
     worktree_prefix = ""
     try:
         git_dir = subprocess.check_output(
@@ -45,13 +74,13 @@ def project_context(cwd: str) -> tuple[bool, str, str, str]:
         git_path = Path(cwd, git_dir).resolve()
         common_path = Path(cwd, common_dir).resolve()
         if git_path != common_path:
-            worktree_prefix = "[工作树] "
+            worktree_prefix = WORKTREE_PREFIXES[language]
         project = common_path.parent.name
         branch = subprocess.check_output(
             ["git", "-C", cwd, "branch", "--show-current"],
             stderr=subprocess.DEVNULL,
             text=True,
-        ).strip() or "无分支"
+        ).strip() or NO_BRANCH_NAMES[language]
     except (OSError, subprocess.CalledProcessError):
         return False, "", "", ""
     return True, worktree_prefix, project, branch
@@ -279,15 +308,16 @@ def read_requested_title(title_file: Path) -> tuple[str, str, str]:
     return "ok", cleaned, content
 
 
-def format_requested_title(value: str, worktree_prefix: str) -> str:
-    title = re.sub(r"^\[工作树\]\s*", "", value).strip()
-    parts = [part.strip() for part in title.split("｜")]
+def format_requested_title(value: str, worktree_prefix: str, language: str) -> str:
+    title = WORKTREE_PREFIX_PATTERN.sub("", value).strip()
+    separator = TITLE_SEPARATORS[language]
+    parts = [part.strip() for part in title.split(separator)]
     if len(parts) != 3 or any(not part for part in parts):
         return ""
     status, initial_request, progress = parts
-    if status not in VALID_STATUSES:
+    if status not in VALID_STATUSES[language]:
         return ""
-    return f"{worktree_prefix}{status}｜{initial_request}｜{progress}"[:60]
+    return f"{worktree_prefix}{separator.join((status, initial_request, progress))}"[:60]
 
 
 def finish_pending_update(
@@ -358,6 +388,7 @@ def apply_requested_title(
     title_file: Path,
     worktree_prefix: str,
     fallback_title: str,
+    language: str,
 ) -> str:
     session_id = state["session_id"]
     if state.get("pending_update"):
@@ -394,7 +425,11 @@ def apply_requested_title(
     )
     if file_result == "missing" and not use_fallback:
         return "unchanged"
-    desired = fallback_title if use_fallback else format_requested_title(file_content, worktree_prefix)
+    desired = (
+        fallback_title
+        if use_fallback
+        else format_requested_title(file_content, worktree_prefix, language)
+    )
     if not desired:
         state["last_result"] = "invalid_title"
         state["last_error"] = "invalid_title"
@@ -438,7 +473,60 @@ def context_for_state(
     phase_result: str,
     current: str,
     title_file: Path,
+    language: str,
 ) -> str:
+    if language == "en":
+        if phase_result == PHASE_SOURCE_UNCONFIRMED or (
+            state and state.get("phase") == PHASE_SOURCE_UNCONFIRMED
+        ):
+            return (
+                f'The source of the current name "{current}" is unconfirmed. '
+                "Keep the existing name and do not write the title file."
+            )
+        if state is None:
+            return (
+                "The title state cannot be saved right now. Keep the existing session name "
+                "and do not write the title file."
+            )
+        if phase_result == RESULT_IO_ERROR:
+            return (
+                f"The title or session state cannot be read right now; title file: {title_file}. "
+                "The pending title will be kept and a later hook event will retry it."
+            )
+        if state.get("phase") == PHASE_INITIALIZING:
+            prompt = (
+                "A new message was received in this resumed session. Title management is now "
+                "starting, with the current name kept as the baseline. "
+                if state.get("origin") == "resumed_after_new_prompt"
+                else ""
+            )
+            return (
+                f"{prompt}Initializing: waiting for the initial Codex title to stabilize. "
+                f"Current name: {current or 'Codex has not generated an initial title yet'}; "
+                f"title file: {title_file}. After the first substantive response or when the "
+                "topic changes, use a file-writing tool to write one line in the format "
+                '"Status | Initial request | Current progress". Choose Status from Scoping, '
+                "Planning, Building, Testing, Fixing, Awaiting confirmation, Completed, or "
+                "Paused. Keep the middle part unchanged once it captures the user's initial "
+                "request, and update the final part with the current progress. Do not write the "
+                "file while the title remains accurate."
+            )
+        if state.get("phase") == PHASE_RETRYABLE_ERROR:
+            return (
+                f"Title synchronization failed temporarily; title file: {title_file}. "
+                "The pending title will be kept and retried on a later hook event. While "
+                "continuing, do not rewrite the file if the title remains accurate."
+            )
+        return (
+            f"Current session name: {current}; title file: {title_file}. When the topic or phase "
+            "changes significantly, use a file-writing tool to write one line in the format "
+            '"Status | Initial request | Current progress". Choose Status from Scoping, '
+            "Planning, Building, Testing, Fixing, Awaiting confirmation, Completed, or Paused. "
+            "Keep the middle part unchanged once it captures the user's initial request, and "
+            "update the final part with the current progress. Do not write the file while the "
+            "title remains accurate."
+        )
+
     if phase_result == PHASE_SOURCE_UNCONFIRMED or (state and state.get("phase") == PHASE_SOURCE_UNCONFIRMED):
         return f"当前名称「{current}」的来源未确认。保留现有名称，不写标题文件。"
     if state is None:
@@ -477,10 +565,20 @@ def context_for_state(
     )
 
 
-def emit(event: str, context: str = "", result: str = "ok") -> None:
+def emit(
+    event: str,
+    context: str = "",
+    result: str = "ok",
+    language: str = DEFAULT_LANGUAGE,
+) -> None:
     if event == "Stop":
         if result == RESULT_IO_ERROR:
-            message = "会话标题同步暂时失败，标题文件已保留，后续会重试。"
+            message = (
+                "Session title synchronization failed temporarily. The title file has been "
+                "kept and will be retried later."
+                if language == "en"
+                else "会话标题同步暂时失败，标题文件已保留，后续会重试。"
+            )
             print(json.dumps({"systemMessage": message}, ensure_ascii=False))
         else:
             print("{}")
@@ -508,10 +606,11 @@ def main() -> int:
 
     home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
     state_dir = home / "session-titles"
+    language = read_language(state_dir / "config.json")
     try:
         state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     except OSError:
-        emit(event, result=RESULT_IO_ERROR)
+        emit(event, result=RESULT_IO_ERROR, language=language)
         return 0
 
     state_file = state_dir / f"{session_id}.state.json"
@@ -519,13 +618,24 @@ def main() -> int:
     applied_file = state_dir / f"{session_id}.applied"
     database = home / "state_5.sqlite"
     source = payload.get("source", "")
-    has_project, worktree_prefix, project, branch = project_context(payload.get("cwd") or os.getcwd())
-    fallback_title = f"{worktree_prefix}{project}·{branch}" if has_project else "摸底｜新会话"
+    has_project, worktree_prefix, project, branch = project_context(
+        payload.get("cwd") or os.getcwd(), language
+    )
+    fallback_title = (
+        f"{worktree_prefix}{project}·{branch}"
+        if has_project
+        else PROJECTLESS_TITLES[language]
+    )
 
     load_result, state = load_state(state_file)
     if load_result == RESULT_IO_ERROR:
         current_result, current = read_thread_name(database, session_id)
-        emit(event, context_for_state(None, RESULT_IO_ERROR, current, title_file), RESULT_IO_ERROR)
+        emit(
+            event,
+            context_for_state(None, RESULT_IO_ERROR, current, title_file, language),
+            RESULT_IO_ERROR,
+            language,
+        )
         return 0
 
     if load_result == "missing":
@@ -535,13 +645,13 @@ def main() -> int:
             if current_result == "ok" and current == applied:
                 state = managed_state(session_id, applied, "legacy_baseline_migrated")
                 if not write_state(state_file, state):
-                    emit(event, result=RESULT_IO_ERROR)
+                    emit(event, result=RESULT_IO_ERROR, language=language)
                     return 0
                 load_result = "ok"
             elif current_result == RESULT_THREAD_NOT_READY:
                 state = managed_state(session_id, applied, RESULT_THREAD_NOT_READY)
                 if not write_state(state_file, state):
-                    emit(event, result=RESULT_IO_ERROR)
+                    emit(event, result=RESULT_IO_ERROR, language=language)
                     return 0
                 load_result = "ok"
             elif event == "UserPromptSubmit" and current_result == "ok":
@@ -550,18 +660,24 @@ def main() -> int:
                     session_id, "ok", current, "resumed_after_new_prompt"
                 )
                 if not write_state(state_file, state):
-                    emit(event, result=RESULT_IO_ERROR)
+                    emit(event, result=RESULT_IO_ERROR, language=language)
                     return 0
                 load_result = "ok"
             else:
                 current = current if current_result == "ok" else ""
-                emit(event, context_for_state(None, PHASE_SOURCE_UNCONFIRMED, current, title_file))
+                emit(
+                    event,
+                    context_for_state(
+                        None, PHASE_SOURCE_UNCONFIRMED, current, title_file, language
+                    ),
+                    language=language,
+                )
                 return 0
         elif event == "SessionStart" and source == "startup":
             current_result, current = read_thread_name(database, session_id)
             state = new_initial_state(session_id, current_result, current)
             if not write_state(state_file, state):
-                emit(event, result=RESULT_IO_ERROR)
+                emit(event, result=RESULT_IO_ERROR, language=language)
                 return 0
             load_result = "ok"
         elif event == "UserPromptSubmit":
@@ -574,28 +690,39 @@ def main() -> int:
                 "resumed_after_new_prompt",
             )
             if not write_state(state_file, state):
-                emit(event, result=RESULT_IO_ERROR)
+                emit(event, result=RESULT_IO_ERROR, language=language)
                 return 0
             load_result = "ok"
         else:
             current_result, current = read_thread_name(database, session_id)
             if current_result != "ok":
                 current = ""
-            emit(event, context_for_state(None, PHASE_SOURCE_UNCONFIRMED, current, title_file))
+            emit(
+                event,
+                context_for_state(
+                    None, PHASE_SOURCE_UNCONFIRMED, current, title_file, language
+                ),
+                language=language,
+            )
             return 0
 
     if state is None or state.get("session_id") != session_id:
-        emit(event, result=RESULT_IO_ERROR)
+        emit(event, result=RESULT_IO_ERROR, language=language)
         return 0
 
     if state.get("pending_update"):
         result = recover_pending_update(state, database, state_file, title_file)
         if result not in {RESULT_UPDATED, "ok", "unchanged"}:
             if event == "Stop":
-                emit(event, result=result)
+                emit(event, result=result, language=language)
             else:
                 current_result, current = read_thread_name(database, session_id)
-                emit(event, context_for_state(state, result, current, title_file), result)
+                emit(
+                    event,
+                    context_for_state(state, result, current, title_file, language),
+                    result,
+                    language,
+                )
             return 0
 
     if state.get("phase") == PHASE_INITIALIZING:
@@ -606,39 +733,68 @@ def main() -> int:
             if not write_state(state_file, state):
                 current_result = RESULT_IO_ERROR
             if event == "Stop":
-                emit(event, result=current_result)
+                emit(event, result=current_result, language=language)
             else:
-                emit(event, context_for_state(state, current_result, "", title_file), current_result)
+                emit(
+                    event,
+                    context_for_state(
+                        state, current_result, "", title_file, language
+                    ),
+                    current_result,
+                    language,
+                )
             return 0
         became_managed = observe_initial_name(state, current, event)
         if not write_state(state_file, state):
-            emit(event, result=RESULT_IO_ERROR)
+            emit(event, result=RESULT_IO_ERROR, language=language)
             return 0
         if became_managed and event == "Stop":
             result = apply_requested_title(
-                state, database, state_file, title_file, worktree_prefix, fallback_title
+                state,
+                database,
+                state_file,
+                title_file,
+                worktree_prefix,
+                fallback_title,
+                language,
             )
-            emit(event, result=result)
+            emit(event, result=result, language=language)
             return 0
         if event == "Stop":
-            emit(event)
+            emit(event, language=language)
             return 0
-        emit(event, context_for_state(state, "ok", current, title_file))
+        emit(
+            event,
+            context_for_state(state, "ok", current, title_file, language),
+            language=language,
+        )
         return 0
 
     if state.get("phase") == PHASE_SOURCE_UNCONFIRMED:
         current_result, current = read_thread_name(database, session_id)
         if event == "Stop":
-            emit(event)
+            emit(event, language=language)
         else:
-            emit(event, context_for_state(state, PHASE_SOURCE_UNCONFIRMED, current, title_file))
+            emit(
+                event,
+                context_for_state(
+                    state, PHASE_SOURCE_UNCONFIRMED, current, title_file, language
+                ),
+                language=language,
+            )
         return 0
 
     if event == "Stop":
         result = apply_requested_title(
-            state, database, state_file, title_file, worktree_prefix, fallback_title
+            state,
+            database,
+            state_file,
+            title_file,
+            worktree_prefix,
+            fallback_title,
+            language,
         )
-        emit(event, result=result)
+        emit(event, result=result, language=language)
         return 0
 
     prompt_apply_result = "ok"
@@ -648,7 +804,13 @@ def main() -> int:
         and title_file.exists()
     ):
         prompt_apply_result = apply_requested_title(
-            state, database, state_file, title_file, worktree_prefix, fallback_title
+            state,
+            database,
+            state_file,
+            title_file,
+            worktree_prefix,
+            fallback_title,
+            language,
         )
 
     current_result, current = read_thread_name(database, session_id)
@@ -658,15 +820,28 @@ def main() -> int:
         state["last_error"] = None
         state["observed_name"] = current
         if not write_state(state_file, state):
-            emit(event, context_for_state(None, RESULT_IO_ERROR, current, title_file), RESULT_IO_ERROR)
+            emit(
+                event,
+                context_for_state(None, RESULT_IO_ERROR, current, title_file, language),
+                RESULT_IO_ERROR,
+                language,
+            )
         else:
-            emit(event, context_for_state(state, RESULT_NAME_CONFLICT, current, title_file))
+            emit(
+                event,
+                context_for_state(
+                    state, RESULT_NAME_CONFLICT, current, title_file, language
+                ),
+                language=language,
+            )
         return 0
 
     current_for_context = current if current_result == "ok" else ""
     result_for_context = current_result if current_result != "ok" else prompt_apply_result
-    context = context_for_state(state, result_for_context, current_for_context, title_file)
-    emit(event, context, result_for_context)
+    context = context_for_state(
+        state, result_for_context, current_for_context, title_file, language
+    )
+    emit(event, context, result_for_context, language)
     return 0
 
 

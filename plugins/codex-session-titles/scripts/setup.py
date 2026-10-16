@@ -21,7 +21,9 @@ class SetupError(RuntimeError):
     """安装前置检查或安全写入失败。"""
 
 
-DATABASE_BACKUP_NAME = "state_5.before-codex-session-titles-0.2.0.sqlite"
+DATABASE_BACKUP_NAME = "state_5.before-codex-session-titles-0.3.0.sqlite"
+DEFAULT_LANGUAGE = "zh"
+SUPPORTED_LANGUAGES = {"zh", "en"}
 REQUIRED_THREAD_COLUMNS = {"id", "name", "archived"}
 
 
@@ -325,16 +327,61 @@ def atomic_write(config_file: Path, text: str) -> None:
         raise SetupError(f"无法安全写入 {config_file}：{exc}") from exc
 
 
-def run() -> int:
+def parse_language_argument(arguments: list[str]) -> str | None:
+    if not arguments:
+        return None
+    if len(arguments) == 2 and arguments[0] == "--lang":
+        language = arguments[1]
+        if language in SUPPORTED_LANGUAGES:
+            return language
+    raise SetupError("--lang 只能指定一次，取值为 zh 或 en。")
+
+
+def read_language_config(config_file: Path) -> tuple[str, dict[str, Any], bool]:
+    try:
+        text = config_file.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return DEFAULT_LANGUAGE, {}, False
+    except (OSError, UnicodeError) as exc:
+        raise SetupError(f"无法安全读取语言配置 {config_file}，未作修改：{exc}") from exc
+    try:
+        config = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise SetupError(f"{config_file} 不是合法 JSON，未作修改：{exc}") from exc
+    if not isinstance(config, dict):
+        raise SetupError(f"{config_file} 的顶层结构必须是 JSON 对象，未作修改。")
+    language = config.get("language")
+    if language is None:
+        return DEFAULT_LANGUAGE, config, False
+    if language not in SUPPORTED_LANGUAGES:
+        raise SetupError(f"{config_file} 的 language 必须是 zh 或 en，未作修改。")
+    return language, config, True
+
+
+def write_language_config(config_file: Path, config: dict[str, Any], language: str) -> None:
+    updated = dict(config)
+    updated["language"] = language
+    atomic_write(
+        config_file,
+        json.dumps(updated, ensure_ascii=False, indent=2) + "\n",
+    )
+
+
+def run(requested_language: str | None = None) -> int:
     configured_home = os.environ.get("CODEX_HOME")
     codex_home = Path(configured_home).expanduser() if configured_home else Path.home() / ".codex"
     codex_home = codex_home.resolve()
     config_file = codex_home / "config.toml"
     state_dir = codex_home / "session-titles"
+    language_file = state_dir / "config.json"
 
     reject_legacy_user_hook(codex_home)
     config_text, config_data = read_config(config_file)
     updated_text, changed = update_config_text(config_text, config_data, str(state_dir))
+    stored_language, language_config, language_config_valid = read_language_config(
+        language_file
+    )
+    language = requested_language or stored_language
     protect_state_database(codex_home)
 
     try:
@@ -355,13 +402,18 @@ def run() -> int:
         print(f"已更新沙箱可写目录：{state_dir}")
     else:
         print(f"沙箱可写目录已存在：{state_dir}")
+    if not language_config_valid or language != stored_language:
+        write_language_config(language_file, language_config, language)
+        print(f"标题语言已设置为：{language}")
+    else:
+        print(f"标题语言保持为：{language}")
     print(f"状态目录已准备（0700）：{state_dir}")
     return 0
 
 
 def main() -> int:
     try:
-        return run()
+        return run(parse_language_argument(sys.argv[1:]))
     except SetupError as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 1

@@ -15,8 +15,10 @@ function printHelp() {
   console.log(`Codex 与 Claude Code 会话标题插件安装器
 
 用法：
-  npx --yes --package=github:panda-z519/codex-session-titles codex-session-titles
-  npx --yes --package=github:panda-z519/codex-session-titles codex-session-titles --help
+  npx --yes github:panda-z519/agent-session-titles
+  npx --yes github:panda-z519/agent-session-titles --codex
+  npx --yes github:panda-z519/agent-session-titles --claude
+  npx --yes github:panda-z519/agent-session-titles --both
 
 环境变量：
   CODEX_HOME  Codex 配置目录，默认使用 ~/.codex
@@ -54,6 +56,22 @@ function commandExists(command) {
       return false;
     }
   });
+}
+
+function parseInstallTarget(args) {
+  if (args.length === 0) {
+    return "auto";
+  }
+
+  const supported = new Set(["--codex", "--claude", "--both"]);
+  const unsupported = args.filter((argument) => !supported.has(argument));
+  if (unsupported.length > 0) {
+    throw new Error(`不支持的参数：${unsupported.join(" ")}。使用 --help 查看用法。`);
+  }
+  if (args.length > 1) {
+    throw new Error("--codex、--claude 和 --both 不能重复或组合使用。");
+  }
+  return args[0].slice(2);
 }
 
 function requireSource(sourcePath, expectedType, description) {
@@ -292,7 +310,7 @@ function installClaude(sourceRoot, targetRoot, claudeConfigDir, childEnv) {
   console.log("Claude 插件安装完成。请重启 Claude Code 以加载插件。");
 }
 
-function install() {
+function install(target) {
   const nodeMajor = Number.parseInt(process.versions.node.split(".")[0], 10);
   if (!Number.isInteger(nodeMajor) || nodeMajor < 20) {
     throw new Error(`需要 Node.js 20 或更新版本，当前版本为 ${process.versions.node}。`);
@@ -300,7 +318,21 @@ function install() {
 
   const hasCodex = commandExists("codex");
   const hasClaude = commandExists("claude");
-  if (!hasCodex && !hasClaude) {
+  const installCodexClient = target === "auto" ? hasCodex : target !== "claude";
+  const installClaudeClient = target === "auto" ? hasClaude : target !== "codex";
+  const missingClients = [];
+  if (installCodexClient && !hasCodex) {
+    missingClients.push("codex");
+  }
+  if (installClaudeClient && !hasClaude) {
+    missingClients.push("claude");
+  }
+  if (missingClients.length > 0) {
+    throw new Error(
+      `所选安装目标在 PATH 中缺少命令：${missingClients.join("、")}。未作任何修改。`,
+    );
+  }
+  if (target === "auto" && !hasCodex && !hasClaude) {
     throw new Error("PATH 中未检测到 codex 或 claude，至少需要安装其中一个客户端。");
   }
 
@@ -321,23 +353,23 @@ function install() {
   };
   const failures = [];
 
-  if (hasCodex) {
+  if (installCodexClient) {
     try {
       installCodex(sourceRoot, targetRoot, codexHome, childEnv);
     } catch (error) {
       failures.push(`Codex：${error instanceof Error ? error.message : String(error)}`);
     }
-  } else {
+  } else if (target === "auto") {
     console.log("PATH 中未检测到 codex，跳过 Codex 插件安装。");
   }
 
-  if (hasClaude) {
+  if (installClaudeClient) {
     try {
       installClaude(sourceRoot, targetRoot, claudeConfigDir, childEnv);
     } catch (error) {
       failures.push(`Claude：${error instanceof Error ? error.message : String(error)}`);
     }
-  } else {
+  } else if (target === "auto") {
     console.log("PATH 中未检测到 claude，跳过 Claude 插件安装。");
   }
 
@@ -352,10 +384,7 @@ function main() {
     printHelp();
     return;
   }
-  if (args.length > 0) {
-    throw new Error(`不支持的参数：${args.join(" ")}。使用 --help 查看用法。`);
-  }
-  install();
+  install(parseInstallTarget(args));
 }
 
 try {

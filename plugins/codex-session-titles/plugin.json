@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "codex-session-titles",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "为 Codex 桌面端本地会话自动维护三段式中文标题。",
   "license": "MIT",
   "extensions": {

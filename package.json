@@ -1,6 +1,6 @@
 {
   "name": "codex-session-titles",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "一条 npx 命令安装 Codex 与 Claude Code 本地会话三段式标题插件",
   "license": "MIT",
   "bin": {

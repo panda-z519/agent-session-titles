@@ -641,6 +641,16 @@ def main() -> int:
         emit(event, result=result)
         return 0
 
+    prompt_apply_result = "ok"
+    if (
+        event == "UserPromptSubmit"
+        and state.get("phase") == PHASE_MANAGED
+        and title_file.exists()
+    ):
+        prompt_apply_result = apply_requested_title(
+            state, database, state_file, title_file, worktree_prefix, fallback_title
+        )
+
     current_result, current = read_thread_name(database, session_id)
     if current_result == "ok" and current != state.get("last_applied_name"):
         state["phase"] = PHASE_SOURCE_UNCONFIRMED
@@ -654,7 +664,7 @@ def main() -> int:
         return 0
 
     current_for_context = current if current_result == "ok" else ""
-    result_for_context = current_result if current_result != "ok" else "ok"
+    result_for_context = current_result if current_result != "ok" else prompt_apply_result
     context = context_for_state(state, result_for_context, current_for_context, title_file)
     emit(event, context, result_for_context)
     return 0

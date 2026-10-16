@@ -217,6 +217,33 @@ class SessionTitleStateTests(unittest.TestCase):
         self.assertNotIn("标题文件：", prompted["hookSpecificOutput"]["additionalContext"])
         self.assertEqual(self.get_name(session_id), "外部改名")
 
+    def test_user_prompt_compensates_pending_title_and_preserves_external_rename(self) -> None:
+        session_id = "prompt-compensation"
+        self.add_thread(session_id, "App 初始标题")
+        self.run_hook("SessionStart", session_id, "startup")
+        self.run_hook("Stop", session_id)
+        self.assertEqual(self.read_state(session_id)["phase"], "managed")
+
+        desired = "修复｜会话标题自动化｜补偿未执行的停止钩子"
+        self.write_title(session_id, desired)
+        compensated = self.run_hook("UserPromptSubmit", session_id)
+
+        self.assertEqual(self.get_name(session_id), desired)
+        self.assertFalse(self.title_path(session_id).exists())
+        self.assertIn(
+            f"当前会话名：{desired}",
+            compensated["hookSpecificOutput"]["additionalContext"],
+        )
+
+        self.set_name(session_id, "外部改名")
+        self.write_title(session_id, "测试｜会话标题自动化｜不得覆盖外部名称")
+        conflicted = self.run_hook("UserPromptSubmit", session_id)
+
+        self.assertEqual(self.get_name(session_id), "外部改名")
+        self.assertTrue(self.title_path(session_id).exists())
+        self.assertEqual(self.read_state(session_id)["phase"], "source_unconfirmed")
+        self.assertIn("来源未确认", conflicted["hookSpecificOutput"]["additionalContext"])
+
     def test_invalid_title_is_retained_until_corrected(self) -> None:
         session_id = "invalid-sidecar-title"
         self.add_thread(session_id, "App 初始标题")

@@ -1,0 +1,20 @@
+{
+  "name": "codex-session-titles-marketplace",
+  "interface": {
+    "displayName": "Codex 会话标题插件源"
+  },
+  "plugins": [
+    {
+      "name": "codex-session-titles",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-session-titles"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

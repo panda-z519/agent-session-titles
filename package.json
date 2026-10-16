@@ -1,0 +1,22 @@
+{
+  "name": "codex-session-titles",
+  "version": "0.1.0",
+  "description": "一条 npx 命令安装 Codex 与 Claude Code 本地会话三段式标题插件",
+  "license": "MIT",
+  "bin": {
+    "codex-session-titles": "bin/codex-session-titles.cjs"
+  },
+  "files": [
+    ".agents/plugins/marketplace.json",
+    "bin/",
+    "claude-marketplace/",
+    "plugins/",
+    "scripts/",
+    "使用说明.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "os": ["darwin", "linux"],
+  "keywords": ["codex", "plugin", "session-title", "hooks"]
+}

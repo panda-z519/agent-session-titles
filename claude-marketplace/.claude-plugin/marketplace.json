@@ -1,0 +1,14 @@
+{
+  "name": "session-titles",
+  "description": "为本地 Claude Code 会话提供三段式标题",
+  "owner": {
+    "name": "panda-z519"
+  },
+  "plugins": [
+    {
+      "name": "claude-session-titles",
+      "source": "./plugins/claude-session-titles",
+      "description": "根据初始需求和当前进展自动维护会话标题"
+    }
+  ]
+}

@@ -1,5 +1,5 @@
 {
-  "description": "在会话启动和提交提示词时同步三段式标题",
+  "description": "在会话启动时保护标题基线，并在提交提示词时确认或应用三段式标题",
   "hooks": {
     "SessionStart": [
       {

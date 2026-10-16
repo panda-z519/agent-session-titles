@@ -20,6 +20,17 @@
         ]
       }
     ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${PLUGIN_ROOT}/hooks/session-title.sh\""
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

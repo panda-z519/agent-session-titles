@@ -2,6 +2,7 @@
 """在 Codex 生命周期钩子中观察初始标题并同步状态文件。"""
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -9,9 +10,10 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import closing
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 DEFAULT_LANGUAGE = "zh"
 SUPPORTED_LANGUAGES = {"zh", "en"}
@@ -28,6 +30,7 @@ VALID_STATUSES = {
         "Paused",
     },
 }
+TITLE_SEGMENTS = ("status", "initial_request", "progress")
 TITLE_SEPARATORS = {"zh": "｜", "en": " | "}
 WORKTREE_PREFIXES = {"zh": "[工作树] ", "en": "[worktree] "}
 PROJECTLESS_TITLES = {"zh": "摸底｜新会话", "en": "Scoping | New session"}
@@ -46,6 +49,8 @@ RESULT_INITIAL_TITLE_PENDING = "initial_title_pending"
 RESULT_INITIAL_TITLE_STABLE = "initial_title_stable"
 RESULT_INITIAL_TITLE_TIMEOUT = "initial_title_timeout"
 INITIAL_EMPTY_STOP_LIMIT = 3
+SESSION_LOCK_TIMEOUT_SECONDS = 3.0
+SESSION_LOCK_POLL_SECONDS = 0.05
 
 
 def read_language(config_file: Path) -> str:
@@ -147,6 +152,21 @@ def load_state(state_file: Path) -> tuple[str, dict[str, Any] | None]:
         return RESULT_IO_ERROR, None
     if not isinstance(state, dict) or state.get("version") != 1:
         return RESULT_IO_ERROR, None
+    # v1 旧状态没有逐段保护字段；只有已由插件写入的三段标题才可安全补齐。
+    if "segment_protection_active" not in state:
+        parsed = parse_three_part_title(state.get("last_applied_name"))
+        active = parsed is not None and state.get("last_result") in {
+            RESULT_UPDATED,
+            "legacy_baseline_migrated",
+        }
+        state["segment_protection_active"] = active
+        state["locked_segments"] = ["initial_request"] if active else []
+    elif not isinstance(state.get("locked_segments"), list):
+        state["locked_segments"] = (
+            ["initial_request"] if state.get("segment_protection_active") else []
+        )
+    if "initial_takeover_pending" not in state:
+        state["initial_takeover_pending"] = False
     return "ok", state
 
 
@@ -178,6 +198,42 @@ def write_state(state_file: Path, state: dict[str, Any]) -> bool:
         return False
 
 
+def acquire_session_lock(lock_file: Path) -> TextIO | None:
+    handle: TextIO | None = None
+    try:
+        handle = lock_file.open("a+", encoding="utf-8")
+        deadline = time.monotonic() + SESSION_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return handle
+            except InterruptedError:
+                continue
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    handle.close()
+                    return None
+                time.sleep(SESSION_LOCK_POLL_SECONDS)
+    except OSError:
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+        return None
+
+
+def release_session_lock(handle: TextIO) -> None:
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        handle.close()
+    except OSError:
+        pass
+
+
 def read_applied(applied_file: Path) -> str:
     try:
         return applied_file.read_text(encoding="utf-8").strip()
@@ -200,6 +256,9 @@ def new_initial_state(
         "initial_observations": 1 if name else 0,
         "empty_stop_count": 0,
         "last_applied_name": None,
+        "segment_protection_active": False,
+        "locked_segments": [],
+        "initial_takeover_pending": False,
         "pending_update": None,
         "last_result": result if result != "ok" else RESULT_INITIAL_TITLE_PENDING,
         "last_error": None,
@@ -207,6 +266,7 @@ def new_initial_state(
 
 
 def managed_state(session_id: str, name: str, result: str) -> dict[str, Any]:
+    segment_protection_active = parse_three_part_title(name) is not None
     return {
         "version": 1,
         "session_id": session_id,
@@ -215,6 +275,9 @@ def managed_state(session_id: str, name: str, result: str) -> dict[str, Any]:
         "initial_observations": 0,
         "empty_stop_count": 0,
         "last_applied_name": name,
+        "segment_protection_active": segment_protection_active,
+        "locked_segments": ["initial_request"] if segment_protection_active else [],
+        "initial_takeover_pending": False,
         "pending_update": None,
         "last_result": result,
         "last_error": None,
@@ -275,6 +338,8 @@ def observe_initial_name(
         if event == "Stop" and state["initial_observations"] >= 2:
             state["phase"] = PHASE_MANAGED
             state["last_applied_name"] = current
+            state["segment_protection_active"] = False
+            state["locked_segments"] = []
             state["last_result"] = RESULT_INITIAL_TITLE_STABLE
             state["last_error"] = None
             return True
@@ -288,6 +353,8 @@ def observe_initial_name(
         if state["empty_stop_count"] >= INITIAL_EMPTY_STOP_LIMIT:
             state["phase"] = PHASE_MANAGED
             state["last_applied_name"] = ""
+            state["segment_protection_active"] = False
+            state["locked_segments"] = []
             state["last_result"] = RESULT_INITIAL_TITLE_TIMEOUT
             state["last_error"] = None
             return True
@@ -308,16 +375,117 @@ def read_requested_title(title_file: Path) -> tuple[str, str, str]:
     return "ok", cleaned, content
 
 
+def parse_three_part_title(value: Any) -> tuple[str, str, tuple[str, str, str]] | None:
+    if not isinstance(value, str):
+        return None
+    prefix_match = WORKTREE_PREFIX_PATTERN.match(value.strip())
+    prefix = prefix_match.group(0) if prefix_match else ""
+    title = WORKTREE_PREFIX_PATTERN.sub("", value).strip()
+    matches: list[tuple[str, str, tuple[str, str, str]]] = []
+    for language, separator in TITLE_SEPARATORS.items():
+        parts = tuple(part.strip() for part in title.split(separator))
+        if len(parts) == 3 and all(parts):
+            matches.append((language, prefix, parts))
+    return matches[0] if len(matches) == 1 else None
+
+
 def format_requested_title(value: str, worktree_prefix: str, language: str) -> str:
     title = WORKTREE_PREFIX_PATTERN.sub("", value).strip()
     separator = TITLE_SEPARATORS[language]
-    parts = [part.strip() for part in title.split(separator)]
+    parts = tuple(part.strip() for part in title.split(separator))
     if len(parts) != 3 or any(not part for part in parts):
         return ""
-    status, initial_request, progress = parts
-    if status not in VALID_STATUSES[language]:
+    return f"{worktree_prefix}{separator.join(parts)}"[:60]
+
+
+def protected_segments(state: dict[str, Any]) -> set[str]:
+    values = state.get("locked_segments", [])
+    if not isinstance(values, list):
+        return set()
+    return {value for value in values if value in TITLE_SEGMENTS}
+
+
+def mark_source_unconfirmed(
+    state: dict[str, Any],
+    state_file: Path,
+    current: str,
+) -> str:
+    state["phase"] = PHASE_SOURCE_UNCONFIRMED
+    state["pending_update"] = None
+    state["initial_takeover_pending"] = False
+    state["last_result"] = RESULT_NAME_CONFLICT
+    state["observed_name"] = current
+    state["last_error"] = None
+    return RESULT_NAME_CONFLICT if write_state(state_file, state) else RESULT_IO_ERROR
+
+
+def reconcile_visible_title(
+    state: dict[str, Any],
+    state_file: Path,
+    current: str,
+) -> str:
+    expected = state.get("last_applied_name")
+    if isinstance(expected, str) and current == expected:
+        return "ok"
+    if not state.get("segment_protection_active"):
+        return mark_source_unconfirmed(state, state_file, current)
+
+    expected_title = parse_three_part_title(expected)
+    current_title = parse_three_part_title(current)
+    if (
+        expected_title is None
+        or current_title is None
+        or expected_title[0] != current_title[0]
+    ):
+        return mark_source_unconfirmed(state, state_file, current)
+
+    locked = protected_segments(state)
+    for segment, expected_part, current_part in zip(
+        TITLE_SEGMENTS, expected_title[2], current_title[2]
+    ):
+        if expected_part != current_part:
+            locked.add(segment)
+    state["phase"] = PHASE_MANAGED
+    state["last_applied_name"] = current
+    state["candidate_name"] = current
+    state["locked_segments"] = [
+        segment for segment in TITLE_SEGMENTS if segment in locked
+    ]
+    state["last_result"] = "external_segments_locked"
+    state["last_error"] = None
+    return "ok" if write_state(state_file, state) else RESULT_IO_ERROR
+
+
+def merge_protected_title(
+    state: dict[str, Any],
+    current: str,
+    requested: str,
+) -> str:
+    if not state.get("segment_protection_active"):
+        return requested
+    current_title = parse_three_part_title(current)
+    requested_title = parse_three_part_title(requested)
+    if current_title is None or requested_title is None:
         return ""
-    return f"{worktree_prefix}{separator.join((status, initial_request, progress))}"[:60]
+    locked = protected_segments(state)
+    parts = list(requested_title[2])
+    for index, segment in enumerate(TITLE_SEGMENTS):
+        if segment in locked:
+            parts[index] = current_title[2][index]
+    return f"{requested_title[1]}{TITLE_SEPARATORS[requested_title[0]].join(parts)}"
+
+
+def automatic_status_is_valid(
+    state: dict[str, Any],
+    title: str,
+    language: str,
+) -> bool:
+    parsed = parse_three_part_title(title)
+    if parsed is None or parsed[0] != language:
+        return False
+    if "status" in protected_segments(state):
+        return True
+    return parsed[2][0] in VALID_STATUSES[language]
 
 
 def finish_pending_update(
@@ -329,6 +497,14 @@ def finish_pending_update(
     state["phase"] = PHASE_MANAGED
     state["last_applied_name"] = pending["desired_name"]
     state["candidate_name"] = pending["desired_name"]
+    state["initial_takeover_pending"] = False
+    if parse_three_part_title(pending["desired_name"]) is not None:
+        state["segment_protection_active"] = True
+        locked = protected_segments(state)
+        locked.add("initial_request")
+        state["locked_segments"] = [
+            segment for segment in TITLE_SEGMENTS if segment in locked
+        ]
     state["pending_update"] = None
     state["last_result"] = RESULT_UPDATED
     state["last_error"] = None
@@ -364,17 +540,48 @@ def recover_pending_update(
     if current == desired:
         return finish_pending_update(state, state_file, title_file, pending)
     if current != expected:
-        state["phase"] = PHASE_SOURCE_UNCONFIRMED
-        state["pending_update"] = None
-        state["last_result"] = RESULT_NAME_CONFLICT
+        if state.get("initial_takeover_pending"):
+            if parse_three_part_title(current) is not None:
+                return mark_source_unconfirmed(state, state_file, current)
+            # 首次接管期间应用仍可能生成标题。先采用新基线，等下一事件确认稳定后再 CAS。
+            state["last_applied_name"] = current
+            state["candidate_name"] = current
+            pending["expected_name"] = current
+            state["pending_update"] = pending
+            state["last_result"] = RESULT_NAME_CONFLICT
+            state["last_error"] = None
+            return (
+                RESULT_NAME_CONFLICT
+                if write_state(state_file, state)
+                else RESULT_IO_ERROR
+            )
+        reconcile_result = reconcile_visible_title(state, state_file, current)
+        if reconcile_result != "ok":
+            return reconcile_result
+        desired = merge_protected_title(state, current, desired)
+        if not desired:
+            return mark_source_unconfirmed(state, state_file, current)
+        pending["expected_name"] = current
+        pending["desired_name"] = desired
+        state["pending_update"] = pending
+        state["last_result"] = "update_pending"
         state["last_error"] = None
-        write_state(state_file, state)
-        return RESULT_NAME_CONFLICT
+        if not write_state(state_file, state):
+            return RESULT_IO_ERROR
+        expected = current
+    else:
+        desired = merge_protected_title(state, current, desired)
+        if not desired:
+            return mark_source_unconfirmed(state, state_file, current)
+        pending["desired_name"] = desired
+        state["pending_update"] = pending
+        if not write_state(state_file, state):
+            return RESULT_IO_ERROR
     result = compare_and_set_thread_name(database, state["session_id"], expected, desired)
     if result == RESULT_UPDATED:
         return finish_pending_update(state, state_file, title_file, pending)
     state["last_result"] = result
-    state["last_error"] = result
+    state["last_error"] = result if result == RESULT_IO_ERROR else None
     if result == RESULT_IO_ERROR:
         state["phase"] = PHASE_RETRYABLE_ERROR
     write_state(state_file, state)
@@ -404,13 +611,12 @@ def apply_requested_title(
         return result
 
     expected = state.get("last_applied_name")
-    if not isinstance(expected, str) or current != expected:
-        state["phase"] = PHASE_SOURCE_UNCONFIRMED
-        state["last_result"] = RESULT_NAME_CONFLICT
-        state["observed_name"] = current
-        state["last_error"] = None
-        write_state(state_file, state)
-        return RESULT_NAME_CONFLICT
+    if not isinstance(expected, str):
+        return mark_source_unconfirmed(state, state_file, current)
+    if current != expected:
+        reconcile_result = reconcile_visible_title(state, state_file, current)
+        if reconcile_result != "ok":
+            return reconcile_result
 
     file_result, file_content, file_text = read_requested_title(title_file)
     if file_result == RESULT_IO_ERROR:
@@ -425,12 +631,20 @@ def apply_requested_title(
     )
     if file_result == "missing" and not use_fallback:
         return "unchanged"
-    desired = (
+    requested = (
         fallback_title
         if use_fallback
         else format_requested_title(file_content, worktree_prefix, language)
     )
+    if not requested:
+        state["last_result"] = "invalid_title"
+        state["last_error"] = "invalid_title"
+        write_state(state_file, state)
+        return "invalid_title"
+    desired = merge_protected_title(state, current, requested)
     if not desired:
+        return mark_source_unconfirmed(state, state_file, current)
+    if not use_fallback and not automatic_status_is_valid(state, desired, language):
         state["last_result"] = "invalid_title"
         state["last_error"] = "invalid_title"
         write_state(state_file, state)
@@ -457,9 +671,6 @@ def apply_requested_title(
     result = compare_and_set_thread_name(database, session_id, current, desired)
     if result == RESULT_UPDATED:
         return finish_pending_update(state, state_file, title_file, pending)
-    if result == RESULT_NAME_CONFLICT:
-        state["phase"] = PHASE_SOURCE_UNCONFIRMED
-        state["pending_update"] = None
     state["last_result"] = result
     state["last_error"] = result if result != RESULT_NAME_CONFLICT else None
     if result == RESULT_IO_ERROR:
@@ -503,13 +714,14 @@ def context_for_state(
             return (
                 f"{prompt}Initializing: waiting for the initial Codex title to stabilize. "
                 f"Current name: {current or 'Codex has not generated an initial title yet'}; "
-                f"title file: {title_file}. After the first substantive response or when the "
-                "topic changes, use a file-writing tool to write one line in the format "
+                f"title file: {title_file}. As soon as you understand the initial request, "
+                "use a file-writing tool to write one line in the format "
                 '"Status | Initial request | Current progress". Choose Status from Scoping, '
                 "Planning, Building, Testing, Fixing, Awaiting confirmation, Completed, or "
                 "Paused. Keep the middle part unchanged once it captures the user's initial "
-                "request, and update the final part with the current progress. Do not write the "
-                "file while the title remains accurate."
+                "request, and update the final part whenever the phase or progress changes. "
+                "Write during the work instead of waiting for the final response. The hook "
+                "synchronizes after the file-writing tool completes."
             )
         if state.get("phase") == PHASE_RETRYABLE_ERROR:
             return (
@@ -523,8 +735,8 @@ def context_for_state(
             '"Status | Initial request | Current progress". Choose Status from Scoping, '
             "Planning, Building, Testing, Fixing, Awaiting confirmation, Completed, or Paused. "
             "Keep the middle part unchanged once it captures the user's initial request, and "
-            "update the final part with the current progress. Do not write the file while the "
-            "title remains accurate."
+            "update the final part with the current progress. Write during the work instead of "
+            "waiting for the final response; do not rewrite an accurate title."
         )
 
     if phase_result == PHASE_SOURCE_UNCONFIRMED or (state and state.get("phase") == PHASE_SOURCE_UNCONFIRMED):
@@ -545,10 +757,10 @@ def context_for_state(
         return (
             f"{prompt}初始化中：等待 Codex 初始标题稳定。"
             f"当前名称：{current or 'Codex 尚未生成初始标题'}；标题文件：{title_file}。"
-            "首轮实质回复后或主题变化时，"
-            "用写入文件的工具写一行「状态｜初始需求｜当前进展」。"
-            "中间段概括用户最初要解决的问题并保持不变；末段概括目前进展。"
-            "标题仍准确时不要写。"
+            "一旦理解用户的初始需求，就用写入文件的工具写一行"
+            "「状态｜初始需求｜当前进展」；阶段或进展变化时及时更新末段。"
+            "中间段概括用户最初要解决的问题并保持不变。"
+            "在工作过程中写入，不要等最终回复；写入工具完成后钩子会立即同步。"
         )
     if state.get("phase") == PHASE_RETRYABLE_ERROR:
         return (
@@ -561,7 +773,7 @@ def context_for_state(
         "主题或阶段明显变化时，"
         "用写入文件的工具写一行「状态｜初始需求｜当前进展」。"
         "中间段概括用户最初要解决的问题并保持不变；末段概括目前进展。"
-        "标题仍准确时不要写。"
+        "在工作过程中及时写入，不要等最终回复；标题仍准确时不要重复写。"
     )
 
 
@@ -571,7 +783,7 @@ def emit(
     result: str = "ok",
     language: str = DEFAULT_LANGUAGE,
 ) -> None:
-    if event == "Stop":
+    if event in {"Stop", "PostToolUse"}:
         if result == RESULT_IO_ERROR:
             message = (
                 "Session title synchronization failed temporarily. The title file has been "
@@ -579,7 +791,10 @@ def emit(
                 if language == "en"
                 else "会话标题同步暂时失败，标题文件已保留，后续会重试。"
             )
-            print(json.dumps({"systemMessage": message}, ensure_ascii=False))
+            if event == "Stop":
+                print(json.dumps({"systemMessage": message}, ensure_ascii=False))
+            else:
+                print("{}")
         else:
             print("{}")
     else:
@@ -591,15 +806,10 @@ def emit(
         }, ensure_ascii=False))
 
 
-def main() -> int:
-    try:
-        payload = json.load(sys.stdin)
-    except (json.JSONDecodeError, OSError):
-        return 0
-
+def run_session_transaction(payload: dict[str, Any]) -> int:
     event = payload.get("hook_event_name", "")
     session_id = payload.get("session_id", "")
-    if event not in {"SessionStart", "UserPromptSubmit", "Stop"}:
+    if event not in {"SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"}:
         return 0
     if not isinstance(session_id, str) or not SESSION_ID_PATTERN.fullmatch(session_id):
         return 0
@@ -618,16 +828,13 @@ def main() -> int:
     applied_file = state_dir / f"{session_id}.applied"
     database = home / "state_5.sqlite"
     source = payload.get("source", "")
-    has_project, worktree_prefix, project, branch = project_context(
-        payload.get("cwd") or os.getcwd(), language
-    )
-    fallback_title = (
-        f"{worktree_prefix}{project}·{branch}"
-        if has_project
-        else PROJECTLESS_TITLES[language]
-    )
 
     load_result, state = load_state(state_file)
+    if event == "PostToolUse" and not title_file.exists() and not (
+        load_result == "ok" and state and state.get("pending_update")
+    ):
+        emit(event, language=language)
+        return 0
     if load_result == RESULT_IO_ERROR:
         current_result, current = read_thread_name(database, session_id)
         emit(
@@ -637,6 +844,15 @@ def main() -> int:
             language,
         )
         return 0
+
+    has_project, worktree_prefix, project, branch = project_context(
+        payload.get("cwd") or os.getcwd(), language
+    )
+    fallback_title = (
+        f"{worktree_prefix}{project}·{branch}"
+        if has_project
+        else PROJECTLESS_TITLES[language]
+    )
 
     if load_result == "missing":
         applied = read_applied(applied_file)
@@ -744,6 +960,29 @@ def main() -> int:
                     language,
                 )
             return 0
+        if title_file.exists() and current and event in {"PostToolUse", "Stop"}:
+            # 明确的三段标题意图已到达；以此刻可见名称为 CAS 基线直接接管。
+            state["candidate_name"] = current
+            state["last_applied_name"] = current
+            state["segment_protection_active"] = False
+            state["locked_segments"] = []
+            state["initial_takeover_pending"] = True
+            state["last_result"] = RESULT_INITIAL_TITLE_STABLE
+            state["last_error"] = None
+            if not write_state(state_file, state):
+                emit(event, result=RESULT_IO_ERROR, language=language)
+                return 0
+            result = apply_requested_title(
+                state,
+                database,
+                state_file,
+                title_file,
+                worktree_prefix,
+                fallback_title,
+                language,
+            )
+            emit(event, result=result, language=language)
+            return 0
         became_managed = observe_initial_name(state, current, event)
         if not write_state(state_file, state):
             emit(event, result=RESULT_IO_ERROR, language=language)
@@ -784,7 +1023,7 @@ def main() -> int:
             )
         return 0
 
-    if event == "Stop":
+    if event in {"Stop", "PostToolUse"}:
         result = apply_requested_title(
             state,
             database,
@@ -815,18 +1054,16 @@ def main() -> int:
 
     current_result, current = read_thread_name(database, session_id)
     if current_result == "ok" and current != state.get("last_applied_name"):
-        state["phase"] = PHASE_SOURCE_UNCONFIRMED
-        state["last_result"] = RESULT_NAME_CONFLICT
-        state["last_error"] = None
-        state["observed_name"] = current
-        if not write_state(state_file, state):
+        reconcile_result = reconcile_visible_title(state, state_file, current)
+        if reconcile_result == RESULT_IO_ERROR:
             emit(
                 event,
                 context_for_state(None, RESULT_IO_ERROR, current, title_file, language),
                 RESULT_IO_ERROR,
                 language,
             )
-        else:
+            return 0
+        elif reconcile_result != "ok":
             emit(
                 event,
                 context_for_state(
@@ -834,7 +1071,7 @@ def main() -> int:
                 ),
                 language=language,
             )
-        return 0
+            return 0
 
     current_for_context = current if current_result == "ok" else ""
     result_for_context = current_result if current_result != "ok" else prompt_apply_result
@@ -843,6 +1080,47 @@ def main() -> int:
     )
     emit(event, context, result_for_context, language)
     return 0
+
+
+def main() -> int:
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, OSError):
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+
+    event = payload.get("hook_event_name", "")
+    session_id = payload.get("session_id", "")
+    if event not in {"SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"}:
+        return 0
+    if not isinstance(session_id, str) or not SESSION_ID_PATTERN.fullmatch(session_id):
+        return 0
+
+    home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    state_dir = home / "session-titles"
+    language = read_language(state_dir / "config.json")
+    try:
+        state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError:
+        emit(event, result=RESULT_IO_ERROR, language=language)
+        return 0
+
+    lock_file = state_dir / f".{session_id}.lock"
+    lock_handle = acquire_session_lock(lock_file)
+    if lock_handle is None:
+        title_file = state_dir / f"{session_id}.txt"
+        emit(
+            event,
+            context_for_state(None, RESULT_IO_ERROR, "", title_file, language),
+            RESULT_IO_ERROR,
+            language,
+        )
+        return 0
+    try:
+        return run_session_transaction(payload)
+    finally:
+        release_session_lock(lock_handle)
 
 
 if __name__ == "__main__":

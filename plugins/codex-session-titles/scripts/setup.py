@@ -21,7 +21,7 @@ class SetupError(RuntimeError):
     """安装前置检查或安全写入失败。"""
 
 
-DATABASE_BACKUP_NAME = "state_5.before-codex-session-titles-0.3.0.sqlite"
+DATABASE_BACKUP_NAME = "state_5.before-codex-session-titles-0.4.0.sqlite"
 DEFAULT_LANGUAGE = "zh"
 SUPPORTED_LANGUAGES = {"zh", "en"}
 REQUIRED_THREAD_COLUMNS = {"id", "name", "archived"}

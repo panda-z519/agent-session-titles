@@ -1,30 +1,83 @@
 # Agent Session Titles
 
-Automatically maintain three-part titles for local Codex and Claude Code sessions:
+[简体中文](README.md) | **English**
+
+Automatically maintain three-part titles for local **Codex** and **Claude Code** sessions:
 
 ```text
 Status | Initial request | Current progress
 Building | Session titles | Add bilingual support
 ```
 
-The initial request stays stable. The status and progress change when the work changes. Chinese titles use `状态｜初始需求｜当前进展`. Worktrees get a `[worktree]` or `[工作树]` prefix. Sessions without a project use the request summary without adding a directory name.
+The initial request stays stable. Status and progress change at meaningful phase transitions. If you manually edit one segment, the plugin preserves that segment while continuing to update the others. Manually chosen status words do not have to match the automatic status list. Worktrees receive a `[worktree]` prefix; sessions without a project do not gain a made-up project name. A title whose source or three-part structure cannot be confirmed is preserved as a whole.
 
-## Let your Agent install it
+## Install with an Agent
 
-Copy the [English Agent instructions](AGENT_INSTALL.md#english-instructions) into a Codex or Claude Code session with local terminal access. The Agent runs the installer and checks the result. You may still need to review and trust new Codex hooks in the app.
+Send the [English Agent installation instructions](AGENT_INSTALL.md#english-instructions) to a Codex or Claude Code Agent with local terminal access. The Agent can check prerequisites, run the installer, inspect any legacy-hook migration, and report the result. You do not need to run terminal commands yourself. Codex may still ask you to review and trust the new hooks in the app.
 
-## Run the installer yourself
+## Install from your terminal
 
-Requires macOS or Linux, Node.js 20+, Python 3.11+, and the `codex` and/or `claude` command:
+Requires macOS or Linux, Node.js 20+, Python 3.11+, and the client command you want to use (`codex` or `claude`). Choose a target:
+
+```bash
+# Auto-detect installed clients; install both when both are available.
+npx --yes github:panda-z519/agent-session-titles
+
+# Codex only.
+npx --yes github:panda-z519/agent-session-titles --codex
+
+# Claude Code only.
+npx --yes github:panda-z519/agent-session-titles --claude
+
+# Require both clients.
+npx --yes github:panda-z519/agent-session-titles --both
+```
+
+New installations default to Chinese. Select English with `--lang en`, or switch back with `--lang zh`. Rerunning the installer without `--lang` keeps the saved choice:
 
 ```bash
 npx --yes github:panda-z519/agent-session-titles --codex --lang en
 npx --yes github:panda-z519/agent-session-titles --claude --lang en
-npx --yes github:panda-z519/agent-session-titles --both --lang en
 ```
 
-Without a target flag, the installer detects available clients. New installs default to Chinese when `--lang` is omitted; reruns preserve the saved choice. Use `--lang zh` to switch to Chinese. If legacy standalone session title hooks exist, add `--migrate` to back up settings and remove only their registrations before installing the plugin. Personal title rules in global `AGENTS.md` or `CLAUDE.md` may also need to be updated when switching languages; the Agent installation prompt covers this check.
+If an older standalone `session-title.sh` hook is registered, add `--migrate`. The installer backs up the relevant configuration and removes only matching legacy title-hook registrations; it keeps the old script, unrelated hooks, and session data. Without `--migrate`, installation stops with an explanation. Personal title rules in global `AGENTS.md` or `CLAUDE.md` may also need updating if they require another language or only allow end-of-turn updates. The Agent installation instructions include that check.
 
-Restart the client after installation. Codex updates titles at `Stop`, with a retry on the next prompt when needed. Claude Code applies a title on the next `UserPromptSubmit` event after the Agent writes the title file; `SessionStart` supplies writing guidance. Existing names of uncertain origin are preserved. More details, verification, and uninstall commands are in the [Chinese README](README.md) and [usage guide](使用说明.md).
+The installer copies plugin files to a stable directory under the user's Codex configuration directory and invokes each client's plugin commands. It has no npm `postinstall` script. Restart the affected client after installation. Codex will ask you to [review and trust non-managed hooks](https://learn.chatgpt.com/docs/hooks), including new hook definitions after an update.
 
-Source code is available under the [MIT license](LICENSE).
+## What the installer changes
+
+| Client | Configuration |
+| --- | --- |
+| Codex | Registers `codex-session-titles`, grants narrowly scoped write access to `~/.codex/session-titles/`, checks the local SQLite state schema, and makes a consistent database backup before configuration changes. |
+| Claude Code | Registers `claude-session-titles` and adds `Edit(~/.cc-session-titles/**)` to `~/.claude/settings.json`, backing up existing settings before editing them. |
+
+`CODEX_HOME` and `CLAUDE_CONFIG_DIR` select non-default client configuration directories.
+
+## Verify the behavior
+
+1. Restart the client and start a **new local session** with a specific request. The Agent should form a three-part title after understanding the request, then update status or progress as the work changes.
+2. Edit one title segment manually and move the work to another phase. Your edited segment should remain intact while unlocked segments continue to update. An unparseable custom title should remain untouched.
+3. In Codex, the plugin tries to apply a title after the tool call that writes its title file. `Stop` and the next prompt provide fallback opportunities. Inspect `~/.codex/session-titles/<session-id>.state.json` for `phase`, `last_result`, and segment locks. A database update alone does not prove the desktop sidebar refreshed immediately.
+4. In Claude Code, the first `UserPromptSubmit` can provide a provisional initial title. Progress written later in the current turn applies on a subsequent `UserPromptSubmit`, subject to [Claude's supported hook output](https://code.claude.com/docs/en/hooks). Inspect `~/.cc-session-titles/<session-id>.txt` and the session state file when troubleshooting.
+
+Historical Codex sessions re-enter title handling after a new user message. Sessions without a reliable plugin baseline may remain protected. The [Chinese usage guide](使用说明.md) has additional manual installation and troubleshooting details.
+
+## Update and uninstall
+
+Rerun the appropriate `npx` command to update, then restart the client. Plugin IDs remain stable across updates. To uninstall either client:
+
+```bash
+codex plugin remove codex-session-titles@codex-session-titles-marketplace
+claude plugin uninstall claude-session-titles@session-titles
+```
+
+Run only the command for the client you installed. You can remove the write-access configuration separately. Existing session data and backups are kept.
+
+## Limits
+
+- Codex currently writes to the local `state_5.sqlite` database. A future Codex schema change may require an update; the setup script checks required columns and does not create a fake database. Sidebar refresh timing depends on the desktop client.
+- Claude Code cannot apply an Agent-written progress change at the end of the same turn through this plugin's standard `Stop` hook. It waits for a supported title-setting event.
+- A difference from the last title applied by the plugin proves an **external edit**, not who made it. Before a baseline exists, the plugin cannot guarantee that it can identify prior manual edits.
+- Lifecycle-hook plugins are intended for local desktop installation and [cannot be submitted with hooks to OpenAI's public plugin directory](https://developers.openai.com/plugins/build/plugins).
+
+Released under the [MIT License](LICENSE).

@@ -1,5 +1,7 @@
 # Agent Session Titles（会话标题自动更新）
 
+**简体中文** | [English](README.en.md)
+
 为 **Codex** 和 **Claude Code** 的本地会话维护可选中文或英文的三段式标题：
 
 ```text
@@ -8,7 +10,7 @@
 Building | Session titles | Add bilingual support
 ```
 
-中间段保留用户最初要解决的问题；状态和末段随工作变化。当前支持的状态为「摸底、方案、开发中、测试、修复、待确认、已完成、搁置」。工作树会自动加上 `[工作树] ` 前缀，无项目会话不加目录名。名称来源不明时，钩子保留现有名称。
+中间段保留用户最初要解决的问题；状态和末段在阶段变化时更新，无须等整个回合结束。当前支持的自动状态为「摸底、方案、开发中、测试、修复、待确认、已完成、搁置」。用户手动修改哪一段，插件就保留并锁定哪一段，其余段继续自动更新；手动状态词可以不在自动状态列表中。工作树会自动加上 `[工作树] ` 前缀，无项目会话不加目录名。无法可靠拆分或确认来源的名称会整体保留。
 
 ## 直接交给 Agent 安装
 
@@ -46,7 +48,7 @@ npx --yes github:panda-z519/agent-session-titles --both
 
 默认标题语言为中文。首次安装选择英文时加 `--lang en`；之后重跑时不指定语言会保留当前选择，切回中文可用 `--lang zh`：
 
-`--lang` 控制插件钩子的标题格式、状态词和给 Agent 的提示。若你自己的全局 `AGENTS.md` 或 `CLAUDE.md` 仍强制另一种标题语言，应同步调整其中的标题规则；上面的 Agent 安装指令包含这一步。
+`--lang` 控制插件钩子的标题格式、状态词和给 Agent 的提示。若你自己的全局 `AGENTS.md` 或 `CLAUDE.md` 仍强制另一种标题语言或“只在回复结束后更新”，应同步调整其中的标题规则；上面的 Agent 安装指令包含这一步。
 
 ```bash
 npx --yes github:panda-z519/agent-session-titles --codex --lang en
@@ -68,10 +70,10 @@ npx --yes github:panda-z519/agent-session-titles --claude --lang zh
 
 ## 验证标题
 
-1. 重启客户端，新建一个**本地会话**，提出具体需求并让助手完成首轮实质回复。
-2. 标题应呈现「状态｜初始需求｜当前进展」。继续沟通并明显改变阶段后，状态或末段应更新，中间段保持原样。
-3. Codex 在 `Stop` 同步标题；若仍有待处理标题文件，下一次发消息时会补偿更新。可检查 `~/.codex/session-titles/<会话ID>.state.json` 的 `phase`、`last_result`。
-4. Claude Code 使用官方 `sessionTitle` 钩子输出；本轮回复写入的标题会在**下一次提交消息时**应用。可检查 `~/.cc-session-titles/<会话ID>.txt`。[Claude 钩子说明](https://code.claude.com/docs/en/hooks)
+1. 重启客户端，新建一个**本地会话**，提出具体需求。助手理解需求后应尽早形成三段标题，阶段明显变化时更新状态与进展。
+2. 分别手动修改一段标题，再让助手进入下一阶段；手动改过的段应保持原样，其他段继续更新。若把整条标题改为无法拆分的格式，插件应保留整条名称。
+3. Codex 在标题文件写入后的工具事件尽早同步；`Stop` 和下一次发消息仍负责补偿。可检查 `~/.codex/session-titles/<会话ID>.state.json` 的 `phase`、`last_result` 和分段锁定信息。侧边栏即时刷新仍取决于桌面端。
+4. Claude Code 使用官方 `sessionTitle` 钩子输出；首条提示词可形成初始标题，本轮 Agent 写入的后续进展仍在**下一次提交消息时**应用。可检查 `~/.cc-session-titles/<会话ID>.txt`。[Claude 钩子说明](https://code.claude.com/docs/en/hooks)
 
 历史会话在收到新消息后才重新纳入 Codex 标题管理。若钩子提示“来源未确认”，会保留已有名称。无项目会话使用需求摘要，不把当前目录冒充项目名。
 
@@ -91,7 +93,8 @@ claude plugin uninstall claude-session-titles@session-titles
 ## 限制
 
 - Codex 标题同步会访问本机 `state_5.sqlite`，属于依赖当前数据库结构的本地集成；结构不符时准备脚本会停止配置，钩子不会创建空数据库。
-- Claude Code 的标题更新发生在下一次 `SessionStart` 或 `UserPromptSubmit`，不能在本轮回复结束时由官方钩子立即改名。
+- Claude Code 在 `SessionStart` 或 `UserPromptSubmit` 才能通过官方钩子设置标题；Agent 在本轮内新写的进展无法通过 `Stop` 立即改名。
+- 插件只能从与上次应用标题的差异推断“外部修改”，无法证明修改者一定是用户。首次接管且没有基线的历史标题仍需保守处理。
 - 本仓库的生命周期钩子面向本地桌面端，不能作为带钩子的插件提交到 OpenAI 公共插件目录。[插件打包说明](https://developers.openai.com/plugins/build/plugins)
 
 手动安装、隔离检查与排查步骤见[使用说明](使用说明.md)。源码按 [MIT 许可证](LICENSE)开放。

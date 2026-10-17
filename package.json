@@ -1,6 +1,6 @@
 {
   "name": "agent-session-titles",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "安装支持中英文的 Codex 与 Claude Code 本地会话标题插件",
   "license": "MIT",
   "repository": {
@@ -9,8 +9,8 @@
   },
   "homepage": "https://github.com/panda-z519/agent-session-titles#readme",
   "bin": {
-    "agent-session-titles": "bin/codex-session-titles.cjs",
-    "codex-session-titles": "bin/codex-session-titles.cjs"
+    "agent-session-titles": "bin/agent-session-titles.cjs",
+    "codex-session-titles": "bin/agent-session-titles.cjs"
   },
   "files": [
     ".agents/plugins/marketplace.json",

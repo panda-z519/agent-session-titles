@@ -21,7 +21,11 @@ class SetupError(RuntimeError):
     """安装前置检查或安全写入失败。"""
 
 
-DATABASE_BACKUP_NAME = "state_5.before-codex-session-titles-0.4.0.sqlite"
+# 备份名随插件版本变化，同一版本只备份一次
+PLUGIN_VERSION = json.loads(
+    (Path(__file__).resolve().parent.parent / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
+)["version"]
+DATABASE_BACKUP_NAME = f"state_5.before-codex-session-titles-{PLUGIN_VERSION}.sqlite"
 DEFAULT_LANGUAGE = "zh"
 SUPPORTED_LANGUAGES = {"zh", "en"}
 REQUIRED_THREAD_COLUMNS = {"id", "name", "archived"}

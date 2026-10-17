@@ -6,13 +6,77 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
-const CODEX_MARKETPLACE_NAME = "codex-session-titles-marketplace";
+const PRODUCT_NAME = "agent-session-titles";
+const CODEX_MARKETPLACE_NAME = PRODUCT_NAME;
 const CODEX_PLUGIN_NAME = "codex-session-titles";
-const CLAUDE_MARKETPLACE_NAME = "session-titles";
+const CLAUDE_MARKETPLACE_NAME = PRODUCT_NAME;
 const CLAUDE_PLUGIN_NAME = "claude-session-titles";
+// 0.6.0 之前的插件源名称与复制目录；升级时自动卸载，避免新旧钩子重复运行
+const LEGACY_CODEX_MARKETPLACE = { name: "codex-session-titles-marketplace", directory: "codex-session-titles" };
+const LEGACY_CLAUDE_MARKETPLACE = { name: "session-titles", directory: "session-titles" };
+
+const useColor = Boolean(process.stdout.isTTY) && !process.env.NO_COLOR;
+const paint = (code) => (text) => (useColor ? `\x1b[${code}m${text}\x1b[0m` : String(text));
+const bold = paint("1");
+const dim = paint("2");
+const red = paint("31");
+const green = paint("32");
+const yellow = paint("33");
+const cyan = paint("36");
+
+// 当前步骤收集的补充说明；不在步骤内时直接输出
+let pendingNotes = null;
+
+function displayPath(value) {
+  const home = os.homedir();
+  return value === home || value.startsWith(`${home}${path.sep}`) ? `~${value.slice(home.length)}` : value;
+}
+
+function note(text) {
+  if (pendingNotes) {
+    pendingNotes.push(text);
+  } else {
+    console.log(`    ${dim(`· ${text}`)}`);
+  }
+}
+
+function printStepLine(mark, label, hint) {
+  const padded = hint ? `${label}${" ".repeat(Math.max(2, 14 - visualWidth(label)))}` : label;
+  console.log(`  ${mark} ${padded}${hint ? dim(hint) : ""}`);
+}
+
+// 中文字符在终端占两列，按显示宽度对齐提示列
+function visualWidth(text) {
+  return [...text].reduce((width, char) => width + (char.charCodeAt(0) > 0xff ? 2 : 1), 0);
+}
+
+function step(label, action) {
+  pendingNotes = [];
+  let result;
+  try {
+    result = action() || {};
+  } catch (error) {
+    const notes = pendingNotes;
+    pendingNotes = null;
+    printStepLine(red("✗"), label);
+    for (const text of notes) note(text);
+    for (const line of error.output || []) console.log(`    ${dim(line)}`);
+    throw error;
+  }
+  const notes = pendingNotes;
+  pendingNotes = null;
+  printStepLine(result.warning ? yellow("!") : green("✓"), label, result.hint);
+  for (const text of notes) note(text);
+  if (result.warning) console.log(`    ${yellow(result.warning)}`);
+  return result;
+}
+
+function section(title) {
+  console.log(`\n  ${bold(title)}`);
+}
 
 function printHelp() {
-  console.log(`Codex 与 Claude Code 会话标题插件安装器
+  console.log(`Agent Session Titles：Codex 与 Claude Code 会话标题插件安装器
 
 用法：
   npx --yes github:panda-z519/agent-session-titles
@@ -113,6 +177,8 @@ function copyCodexMarketplace(sourceRoot, targetRoot) {
   requireSource(sourceManifest, "file", "marketplace 清单");
   requireSource(sourcePlugin, "directory", "插件目录");
 
+  // 整体替换插件副本：Codex 优先读取根目录 plugin.json，旧版残留会让它继续跳过插件钩子
+  fs.rmSync(targetPlugin, { recursive: true, force: true });
   fs.mkdirSync(path.dirname(targetPlugin), { recursive: true });
   fs.cpSync(sourcePlugin, targetPlugin, {
     recursive: true,
@@ -293,7 +359,7 @@ function migrateLegacyHooks(settingsFile, settings, detects, matches, extraLegac
     try { fs.unlinkSync(temporary); } catch { /* 不存在时无需清理 */ }
     throw new Error(`迁移 ${settingsFile} 失败：${error.message}`);
   }
-  console.log(`已备份 ${settingsFile} 至 ${backup}，并移除 ${removed} 条旧版标题钩子。`);
+  note(`已备份 ${displayPath(settingsFile)} 至 ${displayPath(backup)}，移除 ${removed} 条旧版标题钩子`);
   return { backup, migratedText, mode };
 }
 
@@ -306,28 +372,137 @@ function restoreLegacyHooks(settingsFile, migration) {
     fs.copyFileSync(migration.backup, temporary, fs.constants.COPYFILE_EXCL);
     fs.chmodSync(temporary, migration.mode);
     fs.renameSync(temporary, settingsFile);
-    console.log(`插件安装前置步骤失败，已从 ${migration.backup} 恢复旧钩子注册。`);
+    note(`插件安装前置步骤失败，已从 ${displayPath(migration.backup)} 恢复旧钩子注册`);
   } catch (error) {
     try { fs.unlinkSync(temporary); } catch { /* 不存在时无需清理 */ }
     throw new Error(`无法自动恢复 ${settingsFile}，请核对备份 ${migration.backup}：${error.message}`);
   }
 }
 
+function outputLines(text) {
+  return String(text || "").split(/\r?\n/).map((line) => line.trimEnd()).filter(Boolean);
+}
+
+// 子命令输出默认收起，只在失败时随错误展示；返回标准输出的各行
 function runCommand(command, args, env, description) {
   const result = spawnSync(command, args, {
     env,
-    stdio: "inherit",
+    stdio: ["inherit", "pipe", "pipe"],
+    encoding: "utf8",
     shell: false,
   });
+  let failure = null;
   if (result.error) {
-    throw new Error(`${description}失败：${result.error.message}`);
+    failure = `${description}失败：${result.error.message}`;
+  } else if (result.signal) {
+    failure = `${description}被信号 ${result.signal} 中止。`;
+  } else if (result.status !== 0) {
+    failure = `${description}失败，退出码 ${result.status}。`;
   }
-  if (result.signal) {
-    throw new Error(`${description}被信号 ${result.signal} 中止。`);
+  if (failure) {
+    const error = new Error(failure);
+    error.output = [...outputLines(result.stdout), ...outputLines(result.stderr)];
+    throw error;
   }
-  if (result.status !== 0) {
-    throw new Error(`${description}失败，退出码 ${result.status}。`);
+  return outputLines(result.stdout);
+}
+
+function runSetupScript(script, options, env, description) {
+  for (const line of runCommand("python3", [script, ...languageArgs(options)], env, description)) {
+    const home = os.homedir();
+    note(line.split(home).join("~").replace(/[。.]$/, ""));
   }
+}
+
+function tryRunCommand(command, args, env) {
+  try {
+    runCommand(command, args, env, command);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function findCodexMarketplaceRoot(name, env) {
+  let lines;
+  try {
+    lines = runCommand("codex", ["plugin", "marketplace", "list"], env, "读取 Codex 插件源列表");
+  } catch {
+    return null;
+  }
+  for (const line of lines) {
+    const [listed, ...rest] = line.trim().split(/\s+/);
+    if (listed === name) return rest.join(" ") || "";
+  }
+  return null;
+}
+
+function findClaudeMarketplace(name, env) {
+  let lines;
+  try {
+    lines = runCommand("claude", ["plugin", "marketplace", "list", "--json"], env, "读取 Claude 插件源列表");
+  } catch {
+    return null;
+  }
+  try {
+    const listed = JSON.parse(lines.join("\n"));
+    return Array.isArray(listed) ? listed.find((item) => item && item.name === name) || null : null;
+  } catch {
+    return null;
+  }
+}
+
+// 只删除安装器自己复制的旧目录，且目录内确有对应清单
+function removeCopiedMarketplace(directory, manifestRelative) {
+  if (!fs.existsSync(path.join(directory, manifestRelative))) return;
+  fs.rmSync(directory, { recursive: true, force: true });
+  note(`已删除旧插件源目录 ${displayPath(directory)}`);
+}
+
+function cleanupLegacyCodex(codexHome, env) {
+  const legacy = LEGACY_CODEX_MARKETPLACE;
+  const legacyRoot = path.join(codexHome, "marketplaces", legacy.directory);
+  if (findCodexMarketplaceRoot(legacy.name, env) === null) {
+    removeCopiedMarketplace(legacyRoot, path.join(".agents", "plugins", "marketplace.json"));
+    return null;
+  }
+  return step("清理旧插件源", () => {
+    if (tryRunCommand("codex", ["plugin", "remove", `${CODEX_PLUGIN_NAME}@${legacy.name}`], env)) {
+      note(`已卸载 ${CODEX_PLUGIN_NAME}@${legacy.name}`);
+    }
+    if (!tryRunCommand("codex", ["plugin", "marketplace", "remove", legacy.name], env)) {
+      return {
+        hint: legacy.name,
+        warning: `未能移除旧插件源，请手动运行：codex plugin marketplace remove ${legacy.name}`,
+      };
+    }
+    removeCopiedMarketplace(legacyRoot, path.join(".agents", "plugins", "marketplace.json"));
+    return { hint: legacy.name };
+  });
+}
+
+function cleanupLegacyClaude(claudeConfigDir, env) {
+  const legacy = LEGACY_CLAUDE_MARKETPLACE;
+  const legacyRoot = path.join(claudeConfigDir, "marketplaces", legacy.directory);
+  const manifest = path.join(".claude-plugin", "marketplace.json");
+  if (!findClaudeMarketplace(legacy.name, env)) {
+    removeCopiedMarketplace(legacyRoot, manifest);
+    return null;
+  }
+  return step("清理旧插件源", () => {
+    const legacyId = `${CLAUDE_PLUGIN_NAME}@${legacy.name}`;
+    if (tryRunCommand("claude", ["plugin", "uninstall", legacyId, "--scope", "user"], env)) {
+      note(`已卸载 ${legacyId}`);
+    }
+    if (!tryRunCommand("claude", ["plugin", "marketplace", "remove", legacy.name], env)) {
+      return {
+        hint: legacy.name,
+        warning: `未能移除旧插件源，请手动运行：claude plugin marketplace remove ${legacy.name}`,
+      };
+    }
+    removeCopiedMarketplace(legacyRoot, manifest);
+    return { hint: legacy.name };
+  });
 }
 
 function installCodex(sourceRoot, targetRoot, codexHome, childEnv, options) {
@@ -347,7 +522,9 @@ function installCodex(sourceRoot, targetRoot, codexHome, childEnv, options) {
     "scripts",
     "setup.py",
   );
+  const pluginId = `${CODEX_PLUGIN_NAME}@${CODEX_MARKETPLACE_NAME}`;
 
+  section("Codex");
   requireSource(sourceSetupScript, "file", "插件设置脚本");
   const hooks = readCodexHooks(hooksFile);
   let migration = null;
@@ -355,37 +532,33 @@ function installCodex(sourceRoot, targetRoot, codexHome, childEnv, options) {
     if (!options.migrate) {
       throw new Error(`检测到 ${hooksFile} 的旧版标题钩子；请加 --migrate 备份并迁移。`);
     }
-    migration = migrateLegacyHooks(
-      hooksFile, hooks,
-      (command) => referencesCodexLegacyHook({ command }, legacyScript, childEnv),
-      (command) => isStandaloneLegacyCommand(command, legacyScript),
-    );
+    step("迁移旧版钩子", () => {
+      migration = migrateLegacyHooks(
+        hooksFile, hooks,
+        (command) => referencesCodexLegacyHook({ command }, legacyScript, childEnv),
+        (command) => isStandaloneLegacyCommand(command, legacyScript),
+      );
+    });
   }
 
   let installAttempted = false;
   try {
-    console.log(`正在同步 Codex 插件文件到：${targetRoot}`);
-    copyCodexMarketplace(sourceRoot, targetRoot);
-
-    console.log("正在检查并准备 Codex 本地配置……");
-    runCommand("python3", [setupScript, ...languageArgs(options)], childEnv, "运行插件设置脚本");
-
-    console.log("正在添加 Codex 插件源……");
-    runCommand(
-      "codex",
-      ["plugin", "marketplace", "add", targetRoot],
-      childEnv,
-      "添加 Codex 插件源",
-    );
-
-    console.log("正在安装 Codex 会话标题插件……");
+    step("同步插件文件", () => {
+      copyCodexMarketplace(sourceRoot, targetRoot);
+      return { hint: displayPath(targetRoot) };
+    });
+    step("准备本地配置", () => {
+      runSetupScript(setupScript, options, childEnv, "运行插件设置脚本");
+    });
+    step("注册插件源", () => {
+      runCommand("codex", ["plugin", "marketplace", "add", targetRoot], childEnv, "添加 Codex 插件源");
+      return { hint: CODEX_MARKETPLACE_NAME };
+    });
     installAttempted = true;
-    runCommand(
-      "codex",
-      ["plugin", "add", `${CODEX_PLUGIN_NAME}@${CODEX_MARKETPLACE_NAME}`],
-      childEnv,
-      "安装 Codex 会话标题插件",
-    );
+    step("安装插件", () => {
+      runCommand("codex", ["plugin", "add", pluginId], childEnv, "安装 Codex 会话标题插件");
+      return { hint: pluginId };
+    });
   } catch (error) {
     if (migration && !installAttempted) {
       try {
@@ -394,12 +567,13 @@ function installCodex(sourceRoot, targetRoot, codexHome, childEnv, options) {
         throw new Error(`${error.message}；${restoreError.message}`);
       }
     } else if (migration) {
-      console.error(`Codex 插件安装结果未确认；旧钩子配置备份：${migration.backup}`);
+      note(`Codex 插件安装结果未确认；旧钩子配置备份：${displayPath(migration.backup)}`);
     }
     throw error;
   }
 
-  console.log("Codex 插件安装完成。请重启 Codex 桌面端，并在提示时检查并信任插件钩子。");
+  cleanupLegacyCodex(codexHome, childEnv);
+  return "重启 Codex 桌面端，在提示时检查并信任插件钩子";
 }
 
 // 旧版把 Claude 插件源复制在 Codex 目录下；重新注册到新位置后移除这份副本
@@ -410,9 +584,9 @@ function removeLegacyClaudeMarketplace(legacyRoot, marketplaceRoot) {
   }
   try {
     fs.rmSync(legacyRoot, { recursive: true, force: true });
-    console.log(`已移除旧版 Claude 插件源副本：${legacyRoot}`);
+    note(`已移除旧版 Claude 插件源副本 ${displayPath(legacyRoot)}`);
   } catch (error) {
-    console.error(`未能移除旧版 Claude 插件源副本 ${legacyRoot}，可手动删除：${error.message}`);
+    note(`未能移除旧版 Claude 插件源副本 ${displayPath(legacyRoot)}，可手动删除：${error.message}`);
   }
 }
 
@@ -421,7 +595,9 @@ function installClaude(sourceRoot, claudeConfigDir, legacyMarketplaceRoot, child
   const setupScript = path.join(sourceRoot, "scripts", "setup-claude.py");
   const settingsFile = path.join(claudeConfigDir, "settings.json");
   const legacyScript = path.join(claudeConfigDir, "hooks", "session-title.sh");
+  const pluginId = `${CLAUDE_PLUGIN_NAME}@${CLAUDE_MARKETPLACE_NAME}`;
 
+  section("Claude Code");
   requireSource(setupScript, "file", "Claude 设置脚本");
   const settings = readClaudeSettings(settingsFile);
   let migration = null;
@@ -434,53 +610,50 @@ function installClaude(sourceRoot, claudeConfigDir, legacyMarketplaceRoot, child
 
   let installAttempted = false;
   try {
-    console.log(`正在同步 Claude 插件文件到：${marketplaceRoot}`);
-    copyClaudeMarketplace(sourceRoot, marketplaceRoot);
-    console.log("正在检查并准备 Claude Code 用户配置……");
-    runCommand("python3", [setupScript, ...languageArgs(options)], childEnv, "运行 Claude 设置脚本");
-    console.log("正在添加 Claude 插件源……");
-    runCommand(
-      "claude",
-      ["plugin", "marketplace", "add", marketplaceRoot, "--scope", "user"],
-      childEnv,
-      "添加 Claude 插件源",
-    );
-    if (hasLegacy) {
-      migration = migrateLegacyHooks(
-        settingsFile, readClaudeSettings(settingsFile),
-        (command) => referencesLegacySessionTitleHook({ command }, legacyScript),
-        (command) => isStandaloneLegacyCommand(command, legacyScript),
-        isLegacyInstantTitleHook,
+    step("同步插件文件", () => {
+      copyClaudeMarketplace(sourceRoot, marketplaceRoot);
+      return { hint: displayPath(marketplaceRoot) };
+    });
+    step("准备用户配置", () => {
+      runSetupScript(setupScript, options, childEnv, "运行 Claude 设置脚本");
+    });
+    step("注册插件源", () => {
+      runCommand(
+        "claude",
+        ["plugin", "marketplace", "add", marketplaceRoot, "--scope", "user"],
+        childEnv,
+        "添加 Claude 插件源",
       );
+      return { hint: CLAUDE_MARKETPLACE_NAME };
+    });
+    if (hasLegacy) {
+      step("迁移旧版钩子", () => {
+        migration = migrateLegacyHooks(
+          settingsFile, readClaudeSettings(settingsFile),
+          (command) => referencesLegacySessionTitleHook({ command }, legacyScript),
+          (command) => isStandaloneLegacyCommand(command, legacyScript),
+          isLegacyInstantTitleHook,
+        );
+      });
     }
 
-    console.log("正在安装 Claude 会话标题插件……");
     installAttempted = true;
-    runCommand(
-      "claude",
-      [
-        "plugin",
-        "install",
-        `${CLAUDE_PLUGIN_NAME}@${CLAUDE_MARKETPLACE_NAME}`,
-        "--scope",
-        "user",
-      ],
-      childEnv,
-      "安装 Claude 会话标题插件",
-    );
-    // 已安装时 install 不会刷新登记的版本号，升级需再执行 update
-    runCommand(
-      "claude",
-      [
-        "plugin",
-        "update",
-        `${CLAUDE_PLUGIN_NAME}@${CLAUDE_MARKETPLACE_NAME}`,
-        "--scope",
-        "user",
-      ],
-      childEnv,
-      "更新 Claude 会话标题插件版本",
-    );
+    step("安装插件", () => {
+      runCommand(
+        "claude",
+        ["plugin", "install", pluginId, "--scope", "user"],
+        childEnv,
+        "安装 Claude 会话标题插件",
+      );
+      // 已安装时 install 不会刷新登记的版本号，升级需再执行 update
+      runCommand(
+        "claude",
+        ["plugin", "update", pluginId, "--scope", "user"],
+        childEnv,
+        "更新 Claude 会话标题插件版本",
+      );
+      return { hint: pluginId };
+    });
   } catch (error) {
     if (migration && !installAttempted) {
       try {
@@ -489,13 +662,30 @@ function installClaude(sourceRoot, claudeConfigDir, legacyMarketplaceRoot, child
         throw new Error(`${error.message}；${restoreError.message}`);
       }
     } else if (migration) {
-      console.error(`Claude 插件安装结果未确认；旧钩子配置备份：${migration.backup}`);
+      note(`Claude 插件安装结果未确认；旧钩子配置备份：${displayPath(migration.backup)}`);
     }
     throw error;
   }
 
+  cleanupLegacyClaude(claudeConfigDir, childEnv);
   removeLegacyClaudeMarketplace(legacyMarketplaceRoot, marketplaceRoot);
-  console.log("Claude 插件安装完成。请重启 Claude Code 以加载插件。");
+  return "重启 Claude Code 以加载插件";
+}
+
+function readVersion(sourceRoot) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(sourceRoot, "package.json"), "utf8")).version;
+  } catch {
+    return null;
+  }
+}
+
+function printBanner(sourceRoot, options) {
+  const version = readVersion(sourceRoot);
+  const language = { zh: "中文", en: "English" }[options.language];
+  console.log("");
+  console.log(`  ${bold(cyan("Agent Session Titles"))}${version ? dim(`  v${version}`) : ""}`);
+  console.log(`  ${dim(`会话标题插件安装器${language ? ` · 标题语言：${language}` : ""}`)}`);
 }
 
 function install(options) {
@@ -534,43 +724,53 @@ function install(options) {
     process.env.CLAUDE_CONFIG_DIR,
     path.join(os.homedir(), ".claude"),
   );
-  const targetRoot = path.join(codexHome, "marketplaces", "codex-session-titles");
+  const targetRoot = path.join(codexHome, "marketplaces", CODEX_MARKETPLACE_NAME);
   const childEnv = {
     ...process.env,
     CODEX_HOME: codexHome,
     CLAUDE_CONFIG_DIR: claudeConfigDir,
   };
   const failures = [];
+  const nextSteps = [];
+
+  printBanner(sourceRoot, options);
 
   if (installCodexClient) {
     try {
-      installCodex(sourceRoot, targetRoot, codexHome, childEnv, options);
+      nextSteps.push(installCodex(sourceRoot, targetRoot, codexHome, childEnv, options));
     } catch (error) {
       failures.push(`Codex：${error instanceof Error ? error.message : String(error)}`);
     }
   } else if (target === "auto") {
-    console.log("PATH 中未检测到 codex，跳过 Codex 插件安装。");
+    section("Codex");
+    printStepLine(dim("–"), dim("跳过：PATH 中未检测到 codex"));
   }
 
   if (installClaudeClient) {
     try {
-      installClaude(
+      nextSteps.push(installClaude(
         sourceRoot,
         claudeConfigDir,
-        path.join(targetRoot, "claude-marketplace"),
+        path.join(codexHome, "marketplaces", LEGACY_CODEX_MARKETPLACE.directory, "claude-marketplace"),
         childEnv,
         options,
-      );
+      ));
     } catch (error) {
       failures.push(`Claude：${error instanceof Error ? error.message : String(error)}`);
     }
   } else if (target === "auto") {
-    console.log("PATH 中未检测到 claude，跳过 Claude 插件安装。");
+    section("Claude Code");
+    printStepLine(dim("–"), dim("跳过：PATH 中未检测到 claude"));
   }
 
   if (failures.length > 0) {
     throw new Error(`安装未全部完成：\n- ${failures.join("\n- ")}`);
   }
+
+  console.log(`\n  ${green(bold("安装完成"))}`);
+  console.log(`  ${dim("下一步：")}`);
+  nextSteps.forEach((text, index) => console.log(`  ${dim(`${index + 1}.`)} ${text}`));
+  console.log("");
 }
 
 function main() {
@@ -588,12 +788,13 @@ if (require.main === module) {
     main();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`错误：${message}`);
+    console.error(`\n  ${red(bold("错误"))} ${message.split("\n").join("\n  ")}\n`);
     process.exitCode = 1;
   }
 }
 
 module.exports = {
+  copyCodexMarketplace,
   isLegacyInstantTitleHook,
   removeLegacyClaudeMarketplace,
   isStandaloneLegacyCommand,

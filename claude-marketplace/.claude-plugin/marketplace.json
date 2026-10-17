@@ -1,6 +1,6 @@
 {
-  "name": "session-titles",
-  "description": "为本地 Claude Code 会话提供三段式标题",
+  "name": "agent-session-titles",
+  "description": "Agent Session Titles 插件源",
   "owner": {
     "name": "panda-z519"
   },

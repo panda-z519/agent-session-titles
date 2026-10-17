@@ -64,11 +64,11 @@ Historical Codex sessions re-enter title handling after a new user message. Sess
 
 ## Update and uninstall
 
-Rerun the appropriate `npx` command to update, then restart the client. Plugin IDs remain stable across updates. To uninstall either client:
+Rerun the appropriate `npx` command to update, then restart the client. Plugin names stay `codex-session-titles` and `claude-session-titles`; both plugin sources are now named `agent-session-titles`. When upgrading from the old source names, the installer uninstalls the old plugins, removes the old source registrations, and deletes the old copied directories after the new plugins are installed, so hooks do not run twice and no manual cleanup is needed. To uninstall either client:
 
 ```bash
-codex plugin remove codex-session-titles@codex-session-titles-marketplace
-claude plugin uninstall claude-session-titles@session-titles
+codex plugin remove codex-session-titles@agent-session-titles
+claude plugin uninstall claude-session-titles@agent-session-titles
 ```
 
 Run only the command for the client you installed. You can remove the write-access configuration separately. Existing session data and backups are kept.

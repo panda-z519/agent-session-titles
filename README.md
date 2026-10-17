@@ -79,13 +79,13 @@ npx --yes github:panda-z519/agent-session-titles --claude --lang zh
 
 ## 更新与卸载
 
-更新时重新运行相同的 `npx` 命令，并重启对应客户端。安装器可重复执行；Codex 新版本会另存状态库备份。插件内部 ID 沿用 `codex-session-titles` 和 `claude-session-titles`，方便已安装用户升级。
+更新时重新运行相同的 `npx` 命令，并重启对应客户端。安装器可重复执行；Codex 新版本会另存状态库备份。插件名沿用 `codex-session-titles` 和 `claude-session-titles`，两端插件源统一为 `agent-session-titles`。从旧插件源名称升级时，安装器会在新插件装好后自动卸载旧插件、移除旧插件源登记并删除旧复制目录，避免钩子重复运行，无需手动处理。
 
 卸载插件可分别运行：
 
 ```bash
-codex plugin remove codex-session-titles@codex-session-titles-marketplace
-claude plugin uninstall claude-session-titles@session-titles
+codex plugin remove codex-session-titles@agent-session-titles
+claude plugin uninstall claude-session-titles@agent-session-titles
 ```
 
 只使用一端时运行该端的卸载命令。准备脚本添加的可写目录或 `Edit` 规则可从用户配置中单独移除；旧版独立钩子和备份不会被自动删除。

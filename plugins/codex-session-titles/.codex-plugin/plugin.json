@@ -1,0 +1,15 @@
+{
+  "name": "codex-session-titles",
+  "version": "0.6.0",
+  "description": "为 Codex 本地会话自动维护可选中英文的三段式标题。",
+  "license": "MIT",
+  "hooks": "./hooks/hooks.json",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "会话标题自动更新",
+    "shortDescription": "自动维护三段式会话标题",
+    "longDescription": "在本地 Codex 会话中记录初始需求，并随阶段更新标题。",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"]
+  }
+}

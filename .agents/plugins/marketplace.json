@@ -1,7 +1,7 @@
 {
-  "name": "codex-session-titles-marketplace",
+  "name": "agent-session-titles",
   "interface": {
-    "displayName": "Codex 会话标题插件源"
+    "displayName": "Agent Session Titles 插件源"
   },
   "plugins": [
     {

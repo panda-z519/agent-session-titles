@@ -89,7 +89,7 @@ class SessionTitleStateTests(unittest.TestCase):
         )
         return json.loads(result.stdout)
 
-    def test_new_session_waits_for_stable_codex_name_then_applies_sidecar(self) -> None:
+    def test_new_session_waits_for_stable_codex_name_without_title_file(self) -> None:
         session_id = "new-session"
         self.add_thread(session_id)
 
@@ -98,18 +98,24 @@ class SessionTitleStateTests(unittest.TestCase):
         self.assertNotIn("<!--", start["hookSpecificOutput"]["additionalContext"])
         self.assertIsNone(self.get_name(session_id), "SessionStart must not race Codex initial naming")
 
-        self.write_title(session_id, "开发中｜会话标题自动化｜接入标题状态机")
         self.set_name(session_id, "Codex 自动标题")
         self.run_hook("Stop", session_id)
-        self.assertEqual(self.get_name(session_id), "Codex 自动标题")
-        self.assertTrue(self.title_path(session_id).exists(), "pending title is retained while initial name settles")
-
         self.set_name(session_id, "Codex 自动标题 (2)")
         self.run_hook("Stop", session_id)
         self.assertEqual(self.get_name(session_id), "Codex 自动标题 (2)")
-        self.assertTrue(self.title_path(session_id).exists(), "a changing app title resets the settling window")
+        self.assertEqual(self.read_state(session_id)["phase"], "initializing",
+                         "a changing app title resets the settling window")
 
+    def test_title_file_takes_over_initial_name_immediately(self) -> None:
+        session_id = "new-session-title-file"
+        self.add_thread(session_id)
+        self.run_hook("SessionStart", session_id, "startup")
+
+        # 标题文件到达即视为明确意图，以当时可见名称为基线直接接管，不再等待稳定
+        self.write_title(session_id, "开发中｜会话标题自动化｜接入标题状态机")
+        self.set_name(session_id, "Codex 自动标题")
         self.run_hook("Stop", session_id)
+
         self.assertEqual(self.get_name(session_id), "开发中｜会话标题自动化｜接入标题状态机")
         self.assertFalse(self.title_path(session_id).exists())
         state = self.read_state(session_id)

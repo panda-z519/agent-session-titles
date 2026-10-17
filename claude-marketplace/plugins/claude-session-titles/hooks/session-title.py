@@ -378,6 +378,7 @@ def writing_guidance(
     title_file: Path,
     language: str,
     state: dict[str, Any] | None = None,
+    prefix: str = "",
 ) -> str:
     lock_context = locked_part_context(state, language) if state is not None else ""
     provisional = bool(state and state["middle_provisional"])
@@ -390,13 +391,14 @@ def writing_guidance(
         )
         return (
             f"Session title file: {title_file}. {lock_context}{provisional_context}When the "
-            "phase or progress changes, overwrite this file as early as possible in the turn "
-            'with one line in the form "Status | Initial request | Current progress". The '
-            "hook applies it on the next UserPromptSubmit. For unlocked automatic status "
-            "updates, use Scoping, Planning, Building, Testing, Fixing, Awaiting "
-            "confirmation, Completed, or Paused. Preserve locked parts; a manually locked "
-            "status may use other words. The hook adds the worktree prefix, and no write is "
-            "needed while the title is accurate."
+            "phase or progress changes, overwrite this file with the Write tool as early as "
+            'possible in the turn with one line in the form "'
+            f'{prefix}Status | Initial request | Current progress". The desktop app applies '
+            "it immediately; the CLI applies it on the next UserPromptSubmit. For unlocked "
+            "automatic status updates, use Scoping, Planning, Building, Testing, Fixing, "
+            "Awaiting confirmation, Completed, or Paused. Preserve locked parts; a manually "
+            "locked status may use other words. No write is needed while the title is "
+            "accurate. Do not mention title updates to the user."
         )
     provisional_context = (
         "初始需求目前只是临时短名，可根据本轮真实任务精炼一次，"
@@ -406,13 +408,12 @@ def writing_guidance(
     )
     return (
         f"会话标题文件：{title_file}。{lock_context}{provisional_context}"
-        "阶段或进展变化时，在本轮尽早用写入文件的工具覆盖写入一行"
-        "「状态｜初始需求｜当前进展」，钩子会在下一次 "
-        "UserPromptSubmit 应用。未锁定的自动状态更新从摸底、方案、"
+        "阶段或进展变化时，在本轮尽早用 Write 工具覆盖写入一行"
+        f"「{prefix}状态｜初始需求｜当前进展」；桌面端写入后立即生效，"
+        "命令行在下一次提交消息时应用。未锁定的自动状态更新从摸底、方案、"
         "开发中、测试、修复、待确认、已完成、搁置中选择。"
         "保留已锁定字段；人工锁定的状态可用其他词。"
-        "工作树前缀由钩子添加，"
-        "标题仍准确时不要写。"
+        "标题仍准确时不要写，写入时不要向用户提起。"
     )
 
 
@@ -598,6 +599,52 @@ def reconcile_current_title(
     return changed
 
 
+def accept_instant_title(
+    state: dict[str, Any],
+    current: str,
+    requested: list[str] | None,
+    language: str,
+) -> bool:
+    """桌面端 PostToolUse 钩子会把标题文件内容即时设为会话名。
+
+    当前名称与标题文件一致时，视为 Agent 写入而非人工改名，避免误锁字段；
+    已锁定字段保留原值，后续 UserPromptSubmit 会把它们恢复到会话名中。
+    整名保护中的会话若已显示标题文件内容，说明名称已由 Agent 接管，解除保护。
+    """
+    if requested is None or not current:
+        return False
+    if parse_title(current, language) != requested:
+        return False
+    if state["whole_name_protected"]:
+        if requested[0] not in VALID_STATUSES[language]:
+            return False
+        state["whole_name_protected"] = False
+        state["protection_reason"] = None
+        state["locked_parts"] = [False, True, False]
+        state["effective_parts"] = requested.copy()
+    effective = state["effective_parts"]
+    if effective is None:
+        return False
+    if (
+        state["pending_request"] is None
+        and effective == requested
+        and state["confirmed_parts"] == requested
+    ):
+        return False
+    if not state["locked_parts"][0] and requested[0] not in VALID_STATUSES[language]:
+        return False
+    for index in range(3):
+        if not state["locked_parts"][index]:
+            effective[index] = requested[index]
+    if state["middle_provisional"]:
+        state["middle_provisional"] = False
+        state["locked_parts"][1] = True
+    state["confirmed_parts"] = requested.copy()
+    state["pending_request"] = None
+    state["applied_sync_pending"] = True
+    return True
+
+
 def requested_parts_for_state(
     state: dict[str, Any],
     requested: list[str],
@@ -649,6 +696,7 @@ def process_session_start(
     language: str,
 ) -> None:
     current = current_custom_title(payload)
+    prefix = worktree_prefix(payload.get("cwd"), language)
     result, state = resolve_state(
         session_id, language, state_file, applied_file, current
     )
@@ -664,10 +712,13 @@ def process_session_start(
                 return
             emit("SessionStart", context=protected_context(language))
             return
-        emit("SessionStart", context=writing_guidance(title_file, language))
+        emit("SessionStart", context=writing_guidance(title_file, language, prefix=prefix))
         return
 
-    changed = reconcile_current_title(state, current, language)
+    _, file_parts = read_requested_title(title_file, language)
+    changed = accept_instant_title(
+        state, current, file_parts, language
+    ) or reconcile_current_title(state, current, language)
     saved, legacy_saved = persist_reconciled_state(
         state_file, applied_file, state, changed
     )
@@ -677,7 +728,7 @@ def process_session_start(
     if state["whole_name_protected"]:
         emit("SessionStart", context=protected_context(language))
         return
-    context = writing_guidance(title_file, language, state)
+    context = writing_guidance(title_file, language, state, prefix)
     if not legacy_saved:
         context += (
             " Legacy .applied compatibility data will be retried later."
@@ -696,6 +747,7 @@ def process_user_prompt(
     language: str,
 ) -> None:
     current = current_custom_title(payload)
+    prefix = worktree_prefix(payload.get("cwd"), language)
     result, state = resolve_state(
         session_id, language, state_file, applied_file, current
     )
@@ -710,8 +762,11 @@ def process_user_prompt(
             return
         emit("UserPromptSubmit", context=protected_context(language))
         return
+    requested_result, requested = read_requested_title(title_file, language)
     if state is not None:
-        changed = reconcile_current_title(state, current, language)
+        changed = accept_instant_title(
+            state, current, requested, language
+        ) or reconcile_current_title(state, current, language)
         saved, legacy_saved = persist_reconciled_state(
             state_file, applied_file, state, changed
         )
@@ -724,7 +779,6 @@ def process_user_prompt(
     else:
         legacy_saved = True
 
-    requested_result, requested = read_requested_title(title_file, language)
     title_file_requested = requested_result == "ok"
     if requested_result == "error":
         emit("UserPromptSubmit", context=io_error_context(language))
@@ -744,7 +798,7 @@ def process_user_prompt(
         else:
             emit(
                 "UserPromptSubmit",
-                context=writing_guidance(title_file, language, state),
+                context=writing_guidance(title_file, language, state, prefix),
             )
             return
 
@@ -774,10 +828,13 @@ def process_user_prompt(
         title_file_requested or pending_middle_finalization
     )
 
+    shown = parse_title(current, language) if current else None
     if (
         not newly_initialized
         and state["pending_request"] is None
         and desired == state["effective_parts"]
+        # 桌面端即时改名可能覆盖了已锁定字段，此时仍需输出标题把它恢复
+        and (shown is None or shown == desired)
     ):
         if finalize_middle_requested:
             state["middle_provisional"] = False
@@ -785,7 +842,7 @@ def process_user_prompt(
             if not write_state(state_file, state):
                 emit("UserPromptSubmit", context=io_error_context(language))
                 return
-        context = writing_guidance(title_file, language, state)
+        context = writing_guidance(title_file, language, state, prefix)
         if not legacy_saved:
             context += (
                 " Legacy .applied compatibility data will be retried later."
@@ -806,13 +863,11 @@ def process_user_prompt(
     if not write_state(state_file, state):
         emit("UserPromptSubmit", context=io_error_context(language))
         return
-    desired_title = format_title(
-        desired, language, worktree_prefix(payload.get("cwd"), language)
-    )
+    desired_title = format_title(desired, language, prefix)
     emit(
         "UserPromptSubmit",
         title=desired_title,
-        context=writing_guidance(title_file, language, state),
+        context=writing_guidance(title_file, language, state, prefix),
     )
 
 

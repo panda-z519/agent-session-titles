@@ -47,6 +47,7 @@ class SessionTitleTests(unittest.TestCase):
         source: str | None = None,
         session_title: str | None = None,
         cwd: Path | None = None,
+        prompt: str | None = None,
     ) -> dict[str, Any] | None:
         payload: dict[str, Any] = {
             "hook_event_name": event,
@@ -57,6 +58,8 @@ class SessionTitleTests(unittest.TestCase):
             payload["source"] = source
         if session_title is not None:
             payload["session_title"] = session_title
+        if prompt is not None:
+            payload["prompt"] = prompt
         env = os.environ.copy()
         env["HOME"] = str(self.home)
         env["CC_TITLE_DIR"] = str(self.title_dir)
@@ -74,88 +77,77 @@ class SessionTitleTests(unittest.TestCase):
     def hook_output(self, result: dict[str, Any]) -> dict[str, Any]:
         return result["hookSpecificOutput"]
 
-    def test_session_start_preserves_startup_and_resumed_names(self) -> None:
-        sessions = (("startup", "Claude 自动标题"), ("resume", "已有会话名称"))
-        for source, current in sessions:
-            with self.subTest(source=source):
-                session_id = f"session-{source}"
-                self.write_title(
-                    session_id,
-                    "开发中｜会话标题插件｜等待首次提示词",
-                )
-                result = self.run_hook(
-                    "SessionStart",
-                    session_id,
-                    source=source,
-                    session_title=current,
-                )
-                self.assertIsNotNone(result)
-                output = self.hook_output(result)
-                self.assertEqual(output["hookEventName"], "SessionStart")
-                self.assertNotIn("sessionTitle", output)
-                self.assertIn(str(self.title_path(session_id)), output["additionalContext"])
-                self.assertFalse(self.applied_path(session_id).exists())
+    def state_path(self, session_id: str) -> Path:
+        return self.title_dir / f"{session_id}.state.json"
 
-    def test_valid_three_part_title_is_applied_and_recorded(self) -> None:
+    def state(self, session_id: str) -> dict[str, Any]:
+        return json.loads(self.state_path(session_id).read_text(encoding="utf-8"))
+
+    def test_new_session_start_returns_writing_guidance(self) -> None:
+        session_id = "session-startup"
+
+        output = self.hook_output(self.run_hook("SessionStart", session_id, source="startup"))
+
+        self.assertEqual(output["hookEventName"], "SessionStart")
+        self.assertNotIn("sessionTitle", output)
+        self.assertIn(str(self.title_path(session_id)), output["additionalContext"])
+        self.assertFalse(self.applied_path(session_id).exists())
+
+    def test_resumed_session_without_baseline_protects_whole_name(self) -> None:
+        session_id = "session-resume"
+        self.write_title(session_id, "开发中｜会话标题插件｜等待首次提示词")
+
+        output = self.hook_output(
+            self.run_hook(
+                "SessionStart",
+                session_id,
+                source="resume",
+                session_title="已有会话名称",
+            )
+        )
+
+        self.assertNotIn("sessionTitle", output)
+        self.assertIn("整名保护", output["additionalContext"])
+        self.assertTrue(self.state(session_id)["whole_name_protected"])
+
+    def test_title_file_is_applied_then_confirmed(self) -> None:
         session_id = "valid-title"
         requested = "开发中｜会话标题插件｜实现钩子运行逻辑"
         self.write_title(session_id, requested)
 
-        result = self.run_hook(
-            "UserPromptSubmit",
-            session_id,
-            session_title="Claude 自动标题",
-        )
+        first = self.hook_output(self.run_hook("UserPromptSubmit", session_id))
+        self.assertEqual(first["sessionTitle"], requested)
+        # 会话名尚未回传前不写确认基线
+        self.assertFalse(self.applied_path(session_id).exists())
 
-        self.assertIsNotNone(result)
-        output = self.hook_output(result)
-        self.assertEqual(output["hookEventName"], "UserPromptSubmit")
-        self.assertEqual(output["sessionTitle"], requested)
+        second = self.hook_output(
+            self.run_hook("UserPromptSubmit", session_id, session_title=requested)
+        )
+        self.assertNotIn("sessionTitle", second)
+        self.assertIn("标题仍准确时不要写", second["additionalContext"])
         self.assertEqual(
             self.applied_path(session_id).read_text(encoding="utf-8"),
             requested + "\n",
         )
+        self.assertEqual(self.state(session_id)["locked_parts"], [False, True, False])
 
-    def test_unchanged_applied_title_only_returns_writing_guidance(self) -> None:
-        session_id = "unchanged-title"
-        requested = "开发中｜会话标题插件｜实现钩子运行逻辑"
-        self.write_title(session_id, requested)
-        first_result = self.run_hook(
-            "UserPromptSubmit",
-            session_id,
-            session_title="Claude 自动标题",
-        )
-        self.assertEqual(self.hook_output(first_result)["sessionTitle"], requested)
-
-        second_result = self.run_hook(
-            "UserPromptSubmit",
-            session_id,
-            session_title=requested,
-        )
-
-        output = self.hook_output(second_result)
-        self.assertNotIn("sessionTitle", output)
-        self.assertIn(str(self.title_path(session_id)), output["additionalContext"])
-        self.assertIn("标题仍准确时不要写", output["additionalContext"])
-        self.assertEqual(
-            self.applied_path(session_id).read_text(encoding="utf-8"),
-            requested + "\n",
-        )
-
-    def test_missing_title_file_only_returns_writing_guidance(self) -> None:
+    def test_first_prompt_without_title_file_uses_prompt_summary(self) -> None:
         session_id = "missing-title"
 
-        result = self.run_hook(
-            "UserPromptSubmit",
-            session_id,
-            session_title="Claude 自动标题",
+        output = self.hook_output(
+            self.run_hook("UserPromptSubmit", session_id, prompt="请帮我优化会话标题插件")
         )
 
-        self.assertIsNotNone(result)
-        output = self.hook_output(result)
-        self.assertNotIn("sessionTitle", output)
+        self.assertEqual(output["sessionTitle"], "摸底｜优化会话标题插件｜分析首条请求")
         self.assertIn(str(self.title_path(session_id)), output["additionalContext"])
         self.assertFalse(self.applied_path(session_id).exists())
+
+    def test_sensitive_first_prompt_is_not_used_as_title(self) -> None:
+        output = self.hook_output(
+            self.run_hook("UserPromptSubmit", "sensitive", prompt="我的 api_key 是 sk-abcdefgh123")
+        )
+
+        self.assertEqual(output["sessionTitle"], "摸底｜处理首条请求｜分析首条请求")
 
     def test_projectless_session_does_not_add_directory_name(self) -> None:
         session_id = "projectless-title"
@@ -227,32 +219,108 @@ class SessionTitleTests(unittest.TestCase):
             self.hook_output(result)["sessionTitle"],
             "[工作树] 开发中｜会话标题插件｜验证工作树前缀",
         )
+        # 桌面端按文件内容原样改名，提示里必须要求 Agent 自带前缀
+        self.assertIn(
+            "「[工作树] 状态｜初始需求｜当前进展」",
+            self.hook_output(result)["additionalContext"],
+        )
 
-    def test_external_rename_marks_source_unconfirmed_and_preserves_name(self) -> None:
+    def establish_baseline(self, session_id: str, title: str) -> None:
+        self.write_title(session_id, title)
+        self.run_hook("UserPromptSubmit", session_id)
+        self.run_hook("UserPromptSubmit", session_id, session_title=title)
+
+    def test_unparseable_manual_rename_protects_whole_name(self) -> None:
         session_id = "external-rename"
         first_title = "开发中｜会话标题插件｜建立标题基线"
-        self.write_title(session_id, first_title)
-        self.run_hook(
-            "UserPromptSubmit",
-            session_id,
-            session_title="Claude 自动标题",
-        )
+        self.establish_baseline(session_id, first_title)
         self.write_title(session_id, "测试｜会话标题插件｜保护外部改名")
 
-        result = self.run_hook(
-            "UserPromptSubmit",
-            session_id,
-            session_title="人工修改的名称",
+        output = self.hook_output(
+            self.run_hook("UserPromptSubmit", session_id, session_title="人工修改的名称")
         )
 
-        output = self.hook_output(result)
         self.assertNotIn("sessionTitle", output)
-        self.assertIn("来源未确认", output["additionalContext"])
-        self.assertIn("保留现有名称", output["additionalContext"])
+        self.assertIn("整名保护", output["additionalContext"])
         self.assertEqual(
             self.applied_path(session_id).read_text(encoding="utf-8"),
             first_title + "\n",
         )
+
+    def test_manual_part_edit_is_locked_and_preserved(self) -> None:
+        session_id = "manual-part"
+        self.establish_baseline(session_id, "开发中｜会话标题插件｜建立标题基线")
+        self.write_title(session_id, "测试｜会话标题插件｜跑通单元测试")
+
+        output = self.hook_output(
+            self.run_hook(
+                "UserPromptSubmit",
+                session_id,
+                session_title="开发中｜会话标题插件｜我自己写的进展",
+            )
+        )
+
+        self.assertEqual(output["sessionTitle"], "测试｜会话标题插件｜我自己写的进展")
+        self.assertEqual(self.state(session_id)["locked_parts"], [False, True, True])
+
+    def test_instantly_applied_title_is_not_treated_as_manual_edit(self) -> None:
+        session_id = "instant-title"
+        self.establish_baseline(session_id, "开发中｜会话标题插件｜建立标题基线")
+        # 桌面端 PostToolUse 钩子在写入后立即把会话名改成文件内容
+        instant = "测试｜会话标题插件｜跑通单元测试"
+        self.write_title(session_id, instant)
+
+        output = self.hook_output(
+            self.run_hook("UserPromptSubmit", session_id, session_title=instant)
+        )
+
+        self.assertNotIn("sessionTitle", output)
+        state = self.state(session_id)
+        self.assertEqual(state["locked_parts"], [False, True, False])
+        self.assertEqual(state["confirmed_parts"], instant.split("｜"))
+        self.assertEqual(
+            self.applied_path(session_id).read_text(encoding="utf-8"), instant + "\n"
+        )
+
+    def test_instant_title_restores_locked_part(self) -> None:
+        session_id = "instant-locked"
+        self.establish_baseline(session_id, "开发中｜会话标题插件｜建立标题基线")
+        self.run_hook(
+            "UserPromptSubmit",
+            session_id,
+            session_title="开发中｜会话标题插件｜我自己写的进展",
+        )
+        self.run_hook(
+            "UserPromptSubmit",
+            session_id,
+            session_title="开发中｜会话标题插件｜我自己写的进展",
+        )
+        instant = "测试｜会话标题插件｜覆盖了锁定字段"
+        self.write_title(session_id, instant)
+
+        output = self.hook_output(
+            self.run_hook("UserPromptSubmit", session_id, session_title=instant)
+        )
+
+        self.assertEqual(output["sessionTitle"], "测试｜会话标题插件｜我自己写的进展")
+
+    def test_instant_title_lifts_protection_after_desktop_auto_name(self) -> None:
+        session_id = "auto-name"
+        self.run_hook("UserPromptSubmit", session_id, prompt="优化会话标题插件")
+        # 桌面端自动命名会被记成自定义标题，触发整名保护
+        protected = self.hook_output(
+            self.run_hook("UserPromptSubmit", session_id, session_title="Optimize title plugin")
+        )
+        self.assertIn("整名保护", protected["additionalContext"])
+        instant = "方案｜优化会话标题插件｜列出改进项"
+        self.write_title(session_id, instant)
+
+        output = self.hook_output(
+            self.run_hook("UserPromptSubmit", session_id, session_title=instant)
+        )
+
+        self.assertNotIn("整名保护", output["additionalContext"])
+        self.assertFalse(self.state(session_id)["whole_name_protected"])
 
     def test_invalid_titles_are_not_applied(self) -> None:
         invalid_titles = (

@@ -231,7 +231,19 @@ function isStandaloneLegacyCommand(command, scriptPath) {
   return new RegExp(`^\\s*(?:(?:/bin/)?(?:bash|sh)\\s+)?["']?${escaped}["']?\\s*$`).test(expanded);
 }
 
-function migrateLegacyHooks(settingsFile, settings, detects, matches) {
+// 旧版手工配置的桌面端即时改名钩子；插件已内置同一钩子，迁移时一并移除以免重复改名。
+function isLegacyInstantTitleHook(hook) {
+  return Boolean(
+    hook
+      && hook.type === "mcp_tool"
+      && hook.server === "ccd_session_mgmt"
+      && hook.tool === "set_session_title"
+      && typeof hook.if === "string"
+      && hook.if.includes(".cc-session-titles"),
+  );
+}
+
+function migrateLegacyHooks(settingsFile, settings, detects, matches, extraLegacy = () => false) {
   const hooks = settings.hooks || settings;
   if (!hooks || typeof hooks !== "object" || Array.isArray(hooks)) {
     throw new Error(`${settingsFile} 的 hooks 结构无效，未迁移。`);
@@ -252,7 +264,7 @@ function migrateLegacyHooks(settingsFile, settings, detects, matches) {
         if (found && !matches(hook.command)) {
           throw new Error(`${settingsFile} 含有复合或非标准的旧标题钩子命令，未迁移。`);
         }
-        const legacy = found && matches(hook.command);
+        const legacy = (found && matches(hook.command)) || extraLegacy(hook);
         if (legacy) removed += 1;
         return !legacy;
       });
@@ -424,6 +436,7 @@ function installClaude(sourceRoot, targetRoot, claudeConfigDir, childEnv, option
         settingsFile, readClaudeSettings(settingsFile),
         (command) => referencesLegacySessionTitleHook({ command }, legacyScript),
         (command) => isStandaloneLegacyCommand(command, legacyScript),
+        isLegacyInstantTitleHook,
       );
     }
 
@@ -535,10 +548,20 @@ function main() {
   install(parseOptions(args));
 }
 
-try {
-  main();
-} catch (error) {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error(`错误：${message}`);
-  process.exitCode = 1;
+// 仅在直接执行时安装，便于测试按模块引入迁移逻辑而不触发安装
+if (require.main === module) {
+  try {
+    main();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`错误：${message}`);
+    process.exitCode = 1;
+  }
 }
+
+module.exports = {
+  isLegacyInstantTitleHook,
+  isStandaloneLegacyCommand,
+  migrateLegacyHooks,
+  referencesLegacySessionTitleHook,
+};

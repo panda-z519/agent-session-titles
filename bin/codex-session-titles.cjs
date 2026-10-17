@@ -402,8 +402,22 @@ function installCodex(sourceRoot, targetRoot, codexHome, childEnv, options) {
   console.log("Codex 插件安装完成。请重启 Codex 桌面端，并在提示时检查并信任插件钩子。");
 }
 
-function installClaude(sourceRoot, targetRoot, claudeConfigDir, childEnv, options) {
-  const marketplaceRoot = path.join(targetRoot, "claude-marketplace");
+// 旧版把 Claude 插件源复制在 Codex 目录下；重新注册到新位置后移除这份副本
+function removeLegacyClaudeMarketplace(legacyRoot, marketplaceRoot) {
+  const legacyManifest = path.join(legacyRoot, ".claude-plugin", "marketplace.json");
+  if (path.resolve(legacyRoot) === path.resolve(marketplaceRoot) || !fs.existsSync(legacyManifest)) {
+    return;
+  }
+  try {
+    fs.rmSync(legacyRoot, { recursive: true, force: true });
+    console.log(`已移除旧版 Claude 插件源副本：${legacyRoot}`);
+  } catch (error) {
+    console.error(`未能移除旧版 Claude 插件源副本 ${legacyRoot}，可手动删除：${error.message}`);
+  }
+}
+
+function installClaude(sourceRoot, claudeConfigDir, legacyMarketplaceRoot, childEnv, options) {
+  const marketplaceRoot = path.join(claudeConfigDir, "marketplaces", CLAUDE_MARKETPLACE_NAME);
   const setupScript = path.join(sourceRoot, "scripts", "setup-claude.py");
   const settingsFile = path.join(claudeConfigDir, "settings.json");
   const legacyScript = path.join(claudeConfigDir, "hooks", "session-title.sh");
@@ -454,6 +468,19 @@ function installClaude(sourceRoot, targetRoot, claudeConfigDir, childEnv, option
       childEnv,
       "安装 Claude 会话标题插件",
     );
+    // 已安装时 install 不会刷新登记的版本号，升级需再执行 update
+    runCommand(
+      "claude",
+      [
+        "plugin",
+        "update",
+        `${CLAUDE_PLUGIN_NAME}@${CLAUDE_MARKETPLACE_NAME}`,
+        "--scope",
+        "user",
+      ],
+      childEnv,
+      "更新 Claude 会话标题插件版本",
+    );
   } catch (error) {
     if (migration && !installAttempted) {
       try {
@@ -467,6 +494,7 @@ function installClaude(sourceRoot, targetRoot, claudeConfigDir, childEnv, option
     throw error;
   }
 
+  removeLegacyClaudeMarketplace(legacyMarketplaceRoot, marketplaceRoot);
   console.log("Claude 插件安装完成。请重启 Claude Code 以加载插件。");
 }
 
@@ -526,7 +554,13 @@ function install(options) {
 
   if (installClaudeClient) {
     try {
-      installClaude(sourceRoot, targetRoot, claudeConfigDir, childEnv, options);
+      installClaude(
+        sourceRoot,
+        claudeConfigDir,
+        path.join(targetRoot, "claude-marketplace"),
+        childEnv,
+        options,
+      );
     } catch (error) {
       failures.push(`Claude：${error instanceof Error ? error.message : String(error)}`);
     }
@@ -561,6 +595,7 @@ if (require.main === module) {
 
 module.exports = {
   isLegacyInstantTitleHook,
+  removeLegacyClaudeMarketplace,
   isStandaloneLegacyCommand,
   migrateLegacyHooks,
   referencesLegacySessionTitleHook,

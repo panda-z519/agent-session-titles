@@ -12,6 +12,7 @@ const {
   isStandaloneLegacyCommand,
   migrateLegacyHooks,
   referencesLegacySessionTitleHook,
+  removeLegacyClaudeMarketplace,
 } = require("../bin/codex-session-titles.cjs");
 
 const legacyScript = path.join(os.homedir(), ".claude", "hooks", "session-title.sh");
@@ -66,4 +67,21 @@ test("不移除指向其他目录或工具的 mcp_tool 钩子", () => {
   });
 
   assert.deepEqual(migrated.hooks.PostToolUse, [{ matcher: "Write", hooks: [otherTool, otherPath] }]);
+});
+
+test("只移除带 Claude 清单的旧插件源副本，不动其他目录", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "session-titles-legacy-"));
+  const legacy = path.join(directory, "codex", "claude-marketplace");
+  const current = path.join(directory, "claude", "marketplaces", "session-titles");
+  const unrelated = path.join(directory, "codex", "other");
+  fs.mkdirSync(path.join(legacy, ".claude-plugin"), { recursive: true });
+  fs.writeFileSync(path.join(legacy, ".claude-plugin", "marketplace.json"), "{}");
+  fs.mkdirSync(unrelated, { recursive: true });
+
+  removeLegacyClaudeMarketplace(legacy, current);
+  removeLegacyClaudeMarketplace(unrelated, current);
+  removeLegacyClaudeMarketplace(current, current);
+
+  assert.equal(fs.existsSync(legacy), false);
+  assert.equal(fs.existsSync(unrelated), true);
 });

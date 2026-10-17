@@ -52,6 +52,7 @@ SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 CONTROL_CHARACTER_PATTERN = re.compile(r"[\x00-\x1f\x7f]")
 WORKTREE_PREFIX_PATTERN = re.compile(r"^(?:(?:\[工作树\]|\[worktree\])\s*)+")
 MARKDOWN_PREFIX_PATTERN = re.compile(r"^(?:#{1,6}|[-*>])\s*")
+CJK_CHARACTER_PATTERN = re.compile(r"[぀-ヿ㐀-䶿一-鿿가-힯]")
 SENSITIVE_PROMPT_PATTERN = re.compile(
     r"(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|password|passwd|"
     r"secret|authorization\s*:|bearer\s+[A-Za-z0-9._-]+|sk-[A-Za-z0-9_-]{8,}|"
@@ -346,6 +347,9 @@ def extract_initial_request(prompt_value: Any, language: str) -> str:
     line = re.sub(r"\s+", " ", line).strip(" \t\"'`“”‘’。.!！?？:：;；")
     if language == "zh":
         line = re.sub(r"^(?:请帮我|麻烦帮我|帮我|我需要|我想要|请)\s*", "", line)
+    elif CJK_CHARACTER_PATTERN.search(line):
+        # 英文标题不混入中日韩原文，先用通用描述，由 Agent 按任务改写中间段
+        return fallback
     else:
         line = re.sub(
             r"^(?:please\s+|could you\s+|can you\s+|i need you to\s+|i want you to\s+)",

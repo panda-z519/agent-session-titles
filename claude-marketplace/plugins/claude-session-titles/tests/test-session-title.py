@@ -142,6 +142,24 @@ class SessionTitleTests(unittest.TestCase):
         self.assertIn(str(self.title_path(session_id)), output["additionalContext"])
         self.assertFalse(self.applied_path(session_id).exists())
 
+    def test_english_mode_does_not_mix_cjk_prompt_into_title(self) -> None:
+        self.title_dir.mkdir(parents=True)
+        (self.title_dir / "config.json").write_text('{"language": "en"}', encoding="utf-8")
+
+        cjk = self.hook_output(
+            self.run_hook("UserPromptSubmit", "en-cjk", prompt="帮我修复登录页面的报错")
+        )
+        english = self.hook_output(
+            self.run_hook("UserPromptSubmit", "en-ascii", prompt="Please fix the login page error")
+        )
+
+        self.assertEqual(
+            cjk["sessionTitle"], "Scoping | Handle first request | Reviewing first request"
+        )
+        self.assertEqual(
+            english["sessionTitle"], "Scoping | fix the login page error | Reviewing first request"
+        )
+
     def test_sensitive_first_prompt_is_not_used_as_title(self) -> None:
         output = self.hook_output(
             self.run_hook("UserPromptSubmit", "sensitive", prompt="我的 api_key 是 sk-abcdefgh123")

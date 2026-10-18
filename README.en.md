@@ -42,6 +42,18 @@ npx --yes github:panda-z519/agent-session-titles --claude --lang en
 
 If an older standalone `session-title.sh` hook is registered, add `--migrate`. The installer backs up the relevant configuration and removes only matching legacy title-hook registrations; it keeps the old script, unrelated hooks, and session data. Without `--migrate`, installation stops with an explanation. Personal title rules in global `AGENTS.md` or `CLAUDE.md` may also need updating if they require another language or only allow end-of-turn updates. The Agent installation instructions include that check.
 
+### Global rules files
+
+The plugin hooks inject the title rules into every session, so you do **not** need to write them in global `AGENTS.md` (Codex) or `CLAUDE.md` (Claude Code). By default the installer leaves these files unchanged. It scans them for lines that look like handwritten session-title rules and reports their line numbers, so you can review possible duplicates or conflicts.
+
+To also keep the rules in your global rules files, add `--rules`. The installer appends a managed block wrapped in `<!-- agent-session-titles:start -->` and `<!-- agent-session-titles:end -->`, generated in the selected title language, after backing up the file. Later reinstalls refresh an existing block even without `--rules`. To remove the managed block without installing anything:
+
+```bash
+npx --yes github:panda-z519/agent-session-titles --remove-rules
+```
+
+`--remove-rules` also accepts `--codex` or `--claude`. It removes only the content between the markers and keeps the rest of the file.
+
 The installer copies plugin files to a stable directory under the user's Codex configuration directory and invokes each client's plugin commands. It has no npm `postinstall` script. Restart the affected client after installation. Codex will ask you to [review and trust non-managed hooks](https://learn.chatgpt.com/docs/hooks), including new hook definitions after an update.
 
 ## What the installer changes

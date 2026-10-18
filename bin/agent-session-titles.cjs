@@ -14,6 +14,39 @@ const CLAUDE_PLUGIN_NAME = "claude-session-titles";
 // 0.6.0 之前的插件源名称与复制目录；升级时自动卸载，避免新旧钩子重复运行
 const LEGACY_CODEX_MARKETPLACE = { name: "codex-session-titles-marketplace", directory: "codex-session-titles" };
 const LEGACY_CLAUDE_MARKETPLACE = { name: "session-titles", directory: "session-titles" };
+// 写入全局规则文件的托管块：起止标记之间的内容归安装器所有，重装时整体替换
+const RULES_START = "<!-- agent-session-titles:start -->";
+const RULES_END = "<!-- agent-session-titles:end -->";
+const RULES_TEXT = {
+  zh: [
+    "<!-- 由 agent-session-titles 安装器维护；重新安装时整块替换，--remove-rules 时整块删除。 -->",
+    "## 会话标题（agent-session-titles 插件）",
+    "",
+    "- 会话名采用「状态｜初始需求｜当前进展」；状态从 摸底、方案、开发中、测试、修复、待确认、已完成、搁置 中选一个。",
+    "- 中间段概括用户最初要解决的问题，确定后保持不变；末段随阶段或进展变化更新。",
+    "- 标题文件路径和当前名称由插件钩子在会话上下文中提供。理解初始需求后，以及阶段或主题明显变化时，用写入文件的工具覆盖写入一行三段式标题；标题仍准确时不要写。",
+    "- 钩子没有提供标题文件路径，或提示当前名称来源未确认时，保留现有名称，不写标题文件。",
+    "- 本节与钩子注入的提示不一致时，以钩子提示为准。",
+  ],
+  en: [
+    "<!-- Maintained by the agent-session-titles installer; replaced on reinstall and removed by --remove-rules. -->",
+    "## Session titles (agent-session-titles plugin)",
+    "",
+    "- Session names use \"Status | Initial request | Current progress\". Choose Status from Scoping, Planning, Building, Testing, Fixing, Awaiting confirmation, Completed, or Paused.",
+    "- The middle part captures the user's initial request and stays unchanged once set; the final part follows the current phase or progress.",
+    "- The plugin hooks provide the title file path and the current name in the session context. After understanding the initial request, and whenever the phase or topic changes significantly, use a file-writing tool to overwrite that file with one three-part line; do not rewrite an accurate title.",
+    "- If the hooks provide no title file path, or say the current name's source is unconfirmed, keep the existing name and do not write the title file.",
+    "- If this section disagrees with the hook-provided instructions, follow the hooks.",
+  ],
+};
+// 托管块之外疑似手写标题规则的特征，只用于提示，不据此修改文件
+const TITLE_RULE_PATTERNS = [
+  /状态｜初始需求｜当前进展/,
+  /status\s*\|\s*initial request\s*\|\s*current progress/i,
+  /会话标题|会话命名|会话名/,
+  /session[ -]?(?:title|naming|name)/i,
+  /cc-session-titles|session-titles/,
+];
 
 const useColor = Boolean(process.stdout.isTTY) && !process.env.NO_COLOR;
 const paint = (code) => (text) => (useColor ? `\x1b[${code}m${text}\x1b[0m` : String(text));
@@ -88,6 +121,11 @@ function printHelp() {
 选项：
   --lang zh|en  标题语言；首次安装默认中文，更新时保留上次选择
   --migrate     备份配置并迁移旧版用户级标题钩子
+  --rules       在全局 AGENTS.md / CLAUDE.md 末尾写入（或更新）带标记的标题规则块
+  --remove-rules  只删除安装器写入的标题规则块，不安装插件
+
+默认不修改全局规则文件，只提示其中可能与插件规则重复或冲突的行；
+已存在的托管规则块会随重装自动更新。
 
 环境变量：
   CODEX_HOME  Codex 配置目录，默认使用 ~/.codex
@@ -130,6 +168,8 @@ function parseOptions(args) {
   let target = "auto";
   let language = null;
   let migrate = false;
+  let rules = false;
+  let removeRules = false;
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
     if (["--codex", "--claude", "--both"].includes(argument)) {
@@ -148,11 +188,20 @@ function parseOptions(args) {
         throw new Error("--migrate 不能重复指定。");
       }
       migrate = true;
+    } else if (argument === "--rules" || argument === "--remove-rules") {
+      if (rules || removeRules) {
+        throw new Error("--rules 和 --remove-rules 只能指定其中一个，且不能重复。");
+      }
+      rules = argument === "--rules";
+      removeRules = argument === "--remove-rules";
     } else {
       throw new Error(`不支持的参数：${argument}。使用 --help 查看用法。`);
     }
   }
-  return { target, language, migrate };
+  if (removeRules && (language !== null || migrate)) {
+    throw new Error("--remove-rules 只删除规则块，不能与 --lang 或 --migrate 同时使用。");
+  }
+  return { target, language, migrate, rules, removeRules };
 }
 
 function requireSource(sourcePath, expectedType, description) {
@@ -379,6 +428,146 @@ function restoreLegacyHooks(settingsFile, migration) {
   }
 }
 
+function renderRulesBlock(language) {
+  return [RULES_START, ...RULES_TEXT[language], RULES_END].join("\n");
+}
+
+// 拆出托管块；标记缺失、重复或顺序错误时拒绝处理，避免误删用户内容
+function splitManagedRules(text, rulesFile) {
+  const starts = text.split(RULES_START).length - 1;
+  const ends = text.split(RULES_END).length - 1;
+  if (starts === 0 && ends === 0) {
+    return null;
+  }
+  const startIndex = text.indexOf(RULES_START);
+  const endIndex = text.indexOf(RULES_END);
+  if (starts !== 1 || ends !== 1 || endIndex < startIndex) {
+    throw new Error(`${rulesFile} 中的 agent-session-titles 规则标记不完整或重复，未作修改。`);
+  }
+  return {
+    before: text.slice(0, startIndex),
+    after: text.slice(endIndex + RULES_END.length),
+  };
+}
+
+function joinRuleSections(before, block, after) {
+  const parts = [before.replace(/\s+$/, ""), block, after.replace(/^\s+/, "").replace(/\s+$/, "")]
+    .filter(Boolean);
+  return parts.length > 0 ? `${parts.join("\n\n")}\n` : "";
+}
+
+// 返回托管块之外疑似手写标题规则的行号（从 1 开始）
+function findTitleRuleConflicts(text, rulesFile) {
+  const managed = splitManagedRules(text, rulesFile);
+  // 托管块只保留换行，行号不变且不参与匹配
+  const scanned = managed
+    ? managed.before
+      + text.slice(managed.before.length, text.length - managed.after.length).replace(/[^\n]/g, "")
+      + managed.after
+    : text;
+  const conflicts = [];
+  scanned.split("\n").forEach((line, index) => {
+    if (TITLE_RULE_PATTERNS.some((pattern) => pattern.test(line))) conflicts.push(index + 1);
+  });
+  return conflicts;
+}
+
+// mode：write 写入或更新；refresh 仅在已有托管块时更新；remove 删除托管块
+function updateRulesFile(rulesFile, language, mode) {
+  const exists = fs.existsSync(rulesFile);
+  const original = exists ? fs.readFileSync(rulesFile, "utf8") : "";
+  const managed = splitManagedRules(original, rulesFile);
+  let updated = original;
+  if (mode === "remove") {
+    if (!managed) return { changed: false, managed: false };
+    updated = joinRuleSections(managed.before, "", managed.after);
+  } else if (managed) {
+    updated = joinRuleSections(managed.before, renderRulesBlock(language), managed.after);
+  } else if (mode === "write") {
+    updated = joinRuleSections(original, renderRulesBlock(language), "");
+  } else {
+    return { changed: false, managed: false };
+  }
+  if (updated === original) {
+    return { changed: false, managed: mode !== "remove" };
+  }
+  let backup = null;
+  const temporary = `${rulesFile}.session-titles.${process.pid}.tmp`;
+  try {
+    fs.mkdirSync(path.dirname(rulesFile), { recursive: true });
+    const fileMode = exists ? fs.statSync(rulesFile).mode & 0o777 : 0o644;
+    if (exists) {
+      // 同一毫秒内连续更新时追加序号，避免备份名冲突
+      const stamp = Date.now();
+      for (let index = 0; backup === null || fs.existsSync(backup); index += 1) {
+        backup = `${rulesFile}.bak.session-titles.${stamp}${index ? `-${index}` : ""}`;
+      }
+      fs.copyFileSync(rulesFile, backup, fs.constants.COPYFILE_EXCL);
+    }
+    fs.writeFileSync(temporary, updated, { mode: fileMode, flag: "wx" });
+    fs.renameSync(temporary, rulesFile);
+  } catch (error) {
+    try { fs.unlinkSync(temporary); } catch { /* 不存在时无需清理 */ }
+    throw new Error(`更新 ${rulesFile} 失败：${error.message}`);
+  }
+  return { changed: true, managed: mode !== "remove", backup };
+}
+
+function readSavedLanguage(configFile, fallback) {
+  try {
+    const language = JSON.parse(fs.readFileSync(configFile, "utf8")).language;
+    if (["zh", "en"].includes(language)) return language;
+  } catch { /* 读取失败时使用回退语言 */ }
+  return fallback || "zh";
+}
+
+// 安装后处理全局规则文件：默认只提示疑似冲突；--rules 写入托管块；已有托管块随重装更新
+function syncGlobalRules(rulesFile, languageFile, options) {
+  return step("检查全局规则", () => {
+    const language = readSavedLanguage(languageFile, options.language);
+    let result;
+    try {
+      result = updateRulesFile(rulesFile, language, options.rules ? "write" : "refresh");
+    } catch (error) {
+      return { hint: displayPath(rulesFile), warning: error.message };
+    }
+    if (result.changed) {
+      note(`已${options.rules ? "写入" : "更新"}标题规则块：${displayPath(rulesFile)}`);
+      if (result.backup) note(`原文件已备份至 ${displayPath(result.backup)}`);
+    }
+    const text = fs.existsSync(rulesFile) ? fs.readFileSync(rulesFile, "utf8") : "";
+    const conflicts = findTitleRuleConflicts(text, rulesFile);
+    if (conflicts.length > 0) {
+      return {
+        hint: displayPath(rulesFile),
+        warning: `第 ${conflicts.join("、")} 行疑似手写的会话标题规则，可能与插件注入的规则重复或冲突；`
+          + "插件已自带规则，建议核对后删除或改写这些行。",
+      };
+    }
+    return { hint: displayPath(rulesFile) };
+  });
+}
+
+function removeGlobalRules(options) {
+  const codexHome = resolveConfigDirectory(process.env.CODEX_HOME, path.join(os.homedir(), ".codex"));
+  const claudeConfigDir = resolveConfigDirectory(
+    process.env.CLAUDE_CONFIG_DIR,
+    path.join(os.homedir(), ".claude"),
+  );
+  const files = [];
+  if (options.target !== "claude") files.push(path.join(codexHome, "AGENTS.md"));
+  if (options.target !== "codex") files.push(path.join(claudeConfigDir, "CLAUDE.md"));
+  section("删除标题规则块");
+  for (const rulesFile of files) {
+    step(displayPath(rulesFile), () => {
+      const result = updateRulesFile(rulesFile, "zh", "remove");
+      if (result.backup) note(`原文件已备份至 ${displayPath(result.backup)}`);
+      return { hint: result.changed ? "已删除" : "无托管规则块" };
+    });
+  }
+  console.log("");
+}
+
 function outputLines(text) {
   return String(text || "").split(/\r?\n/).map((line) => line.trimEnd()).filter(Boolean);
 }
@@ -573,6 +762,11 @@ function installCodex(sourceRoot, targetRoot, codexHome, childEnv, options) {
   }
 
   cleanupLegacyCodex(codexHome, childEnv);
+  syncGlobalRules(
+    path.join(codexHome, "AGENTS.md"),
+    path.join(codexHome, "session-titles", "config.json"),
+    options,
+  );
   return "重启 Codex 桌面端，在提示时检查并信任插件钩子";
 }
 
@@ -669,6 +863,10 @@ function installClaude(sourceRoot, claudeConfigDir, legacyMarketplaceRoot, child
 
   cleanupLegacyClaude(claudeConfigDir, childEnv);
   removeLegacyClaudeMarketplace(legacyMarketplaceRoot, marketplaceRoot);
+  const titleDir = process.env.CC_TITLE_DIR
+    ? resolveConfigDirectory(process.env.CC_TITLE_DIR, "")
+    : path.join(os.homedir(), ".cc-session-titles");
+  syncGlobalRules(path.join(claudeConfigDir, "CLAUDE.md"), path.join(titleDir, "config.json"), options);
   return "重启 Claude Code 以加载插件";
 }
 
@@ -779,7 +977,12 @@ function main() {
     printHelp();
     return;
   }
-  install(parseOptions(args));
+  const options = parseOptions(args);
+  if (options.removeRules) {
+    removeGlobalRules(options);
+    return;
+  }
+  install(options);
 }
 
 // 仅在直接执行时安装，便于测试按模块引入迁移逻辑而不触发安装
@@ -795,6 +998,10 @@ if (require.main === module) {
 
 module.exports = {
   copyCodexMarketplace,
+  findTitleRuleConflicts,
+  parseOptions,
+  renderRulesBlock,
+  updateRulesFile,
   isLegacyInstantTitleHook,
   removeLegacyClaudeMarketplace,
   isStandaloneLegacyCommand,

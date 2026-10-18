@@ -48,7 +48,7 @@ npx --yes github:panda-z519/agent-session-titles --both
 
 默认标题语言为中文。首次安装选择英文时加 `--lang en`；之后重跑时不指定语言会保留当前选择，切回中文可用 `--lang zh`：
 
-`--lang` 控制插件钩子的标题格式、状态词和给 Agent 的提示。若你自己的全局 `AGENTS.md` 或 `CLAUDE.md` 仍强制另一种标题语言或“只在回复结束后更新”，应同步调整其中的标题规则；上面的 Agent 安装指令包含这一步。
+`--lang` 控制插件钩子的标题格式、状态词和给 Agent 的提示。若你自己的全局 `AGENTS.md` 或 `CLAUDE.md` 仍强制另一种标题语言或“只在回复结束后更新”，安装器会提示疑似冲突的行，应同步调整；见下方[全局规则文件](#全局规则文件)。
 
 ```bash
 npx --yes github:panda-z519/agent-session-titles --codex --lang en
@@ -56,6 +56,18 @@ npx --yes github:panda-z519/agent-session-titles --claude --lang zh
 ```
 
 已有旧版独立标题钩子时，加 `--migrate` 才会迁移并安装插件；不加会报错并保持旧配置。迁移只删除旧标题钩子的注册条目，保留脚本、其他钩子和会话数据，并备份原配置。
+
+### 全局规则文件
+
+标题规则由插件钩子在每个会话中自动注入，**不需要**在全局 `AGENTS.md`（Codex）或 `CLAUDE.md`（Claude Code）里手写。安装器默认不修改这两个文件，只扫描其中疑似手写的会话标题规则，并在输出里指出行号，提醒你核对，避免和插件规则重复或冲突。
+
+如果希望在钩子之外也把规则写进全局规则文件，可以加 `--rules`。安装器会在文件末尾写入一个由 `<!-- agent-session-titles:start -->` 和 `<!-- agent-session-titles:end -->` 包住的托管块，内容随标题语言生成，修改前会备份原文件。之后重新安装时，即使不加 `--rules`，已有的托管块也会整块更新。删除托管块（不安装插件）：
+
+```bash
+npx --yes github:panda-z519/agent-session-titles --remove-rules
+```
+
+`--remove-rules` 同样支持 `--codex` / `--claude`，只删除标记之间的内容，并保留文件其余部分。
 
 安装器从 GitHub 读取此仓库，将插件文件复制到用户目录中的稳定位置，再调用相应客户端的插件命令。它不会在 `npm install` 阶段执行 `postinstall`。新安装的 Codex 钩子需要在 Codex 中检查并信任；随后重启对应客户端，使用新的本地会话验证。[Codex 钩子信任说明](https://learn.chatgpt.com/docs/hooks)
 

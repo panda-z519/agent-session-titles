@@ -2,6 +2,8 @@
 
 **简体中文** | [English](README.en.md)
 
+[![LINUX DO](https://img.shields.io/badge/LINUX_DO-community-1a1a1a)](https://linux.do)
+
 为 **Codex** 和 **Claude Code** 的本地会话维护可选中文或英文的三段式标题：
 
 ```text
@@ -109,5 +111,9 @@ claude plugin uninstall claude-session-titles@agent-session-titles
 - 即时改名按标题文件内容原样设置，锁定字段若被覆盖，会在下一次提交消息时恢复。自定义 `CC_TITLE_DIR` 时即时改名不生效（钩子条件固定匹配 `~/.cc-session-titles/`）。
 - 插件只能从与上次应用标题的差异推断“外部修改”，无法证明修改者一定是用户。首次接管且没有基线的历史标题仍需保守处理。
 - 本仓库的生命周期钩子面向本地桌面端，不能作为带钩子的插件提交到 OpenAI 公共插件目录。[插件打包说明](https://developers.openai.com/plugins/build/plugins)
+
+## 社区
+
+感谢 [LINUX DO](https://linux.do) 社区，本项目在这里发布、交流并收集佬友们的反馈。
 
 手动安装、隔离检查与排查步骤见[使用说明](使用说明.md)。源码按 [MIT 许可证](LICENSE)开放。

@@ -2,6 +2,8 @@
 
 [简体中文](README.md) | **English**
 
+[![LINUX DO](https://img.shields.io/badge/LINUX_DO-community-1a1a1a)](https://linux.do)
+
 Automatically maintain three-part titles for local **Codex** and **Claude Code** sessions:
 
 ```text
@@ -92,5 +94,9 @@ Run only the command for the client you installed. You can remove the write-acce
 - Immediate renaming applies the title file as written; a locked part that gets overwritten is restored on the next prompt. It does not work with a custom `CC_TITLE_DIR`, because the hook condition matches `~/.cc-session-titles/`.
 - A difference from the last title applied by the plugin proves an **external edit**, not who made it. Before a baseline exists, the plugin cannot guarantee that it can identify prior manual edits.
 - Lifecycle-hook plugins are intended for local desktop installation and [cannot be submitted with hooks to OpenAI's public plugin directory](https://developers.openai.com/plugins/build/plugins).
+
+## Community
+
+Thanks to the [LINUX DO](https://linux.do) community, where this project is shared, discussed, and improved with user feedback.
 
 Released under the [MIT License](LICENSE).

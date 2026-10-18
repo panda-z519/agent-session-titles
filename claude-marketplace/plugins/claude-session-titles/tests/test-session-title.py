@@ -91,6 +91,9 @@ class SessionTitleTests(unittest.TestCase):
         self.assertEqual(output["hookEventName"], "SessionStart")
         self.assertNotIn("sessionTitle", output)
         self.assertIn(str(self.title_path(session_id)), output["additionalContext"])
+        # 全新会话还没有初始需求，不能提示「已建立的初始需求保持不变」
+        self.assertNotIn("已建立的初始需求", output["additionalContext"])
+        self.assertIn("即使只是聊天", output["additionalContext"])
         self.assertFalse(self.applied_path(session_id).exists())
 
     def test_resumed_session_without_baseline_protects_whole_name(self) -> None:
@@ -142,6 +145,41 @@ class SessionTitleTests(unittest.TestCase):
         self.assertIn(str(self.title_path(session_id)), output["additionalContext"])
         self.assertFalse(self.applied_path(session_id).exists())
 
+    def test_desktop_system_reminder_before_prompt_is_skipped(self) -> None:
+        # 桌面端在原话前插入的提醒块含工作树路径，曾导致每次都退回占位名
+        prompt = (
+            "<system-reminder>\nYou are operating in a git worktree.\n"
+            "Worktree path: /Users/someone/repo/.claude/worktrees/demo\n"
+            "</system-reminder>\n\n最近好像身体好了些"
+        )
+
+        output = self.hook_output(
+            self.run_hook("UserPromptSubmit", "desktop-reminder", prompt=prompt)
+        )
+
+        self.assertEqual(output["sessionTitle"], "摸底｜最近好像身体好了些｜分析首条请求")
+
+    def test_chat_status_is_accepted_and_first_turn_must_write(self) -> None:
+        session_id = "chat-title"
+        first = self.hook_output(
+            self.run_hook("UserPromptSubmit", session_id, prompt="最近好像身体好了些")
+        )
+        # 纯聊天会话也要先写一次标题，并能用「聊天」状态
+        self.assertIn("即使只是聊天", first["additionalContext"])
+        self.assertIn("「聊天」", first["additionalContext"])
+
+        requested = "聊天｜身体近况｜分享好转感受"
+        self.write_title(session_id, requested)
+        second = self.hook_output(
+            self.run_hook(
+                "UserPromptSubmit",
+                session_id,
+                session_title="摸底｜最近好像身体好了些｜分析首条请求",
+            )
+        )
+
+        self.assertEqual(second["sessionTitle"], requested)
+
     def test_english_mode_does_not_mix_cjk_prompt_into_title(self) -> None:
         self.title_dir.mkdir(parents=True)
         (self.title_dir / "config.json").write_text('{"language": "en"}', encoding="utf-8")
@@ -177,7 +215,7 @@ class SessionTitleTests(unittest.TestCase):
         self.assertEqual(self.hook_output(result)["sessionTitle"], requested)
         self.assertNotIn(self.cwd.name, self.hook_output(result)["sessionTitle"])
 
-    def test_worktree_session_adds_prefix_once(self) -> None:
+    def test_worktree_session_uses_plain_three_part_title(self) -> None:
         repository = self.root / "repository"
         worktree = self.root / "worktree"
         repository.mkdir()
@@ -226,22 +264,21 @@ class SessionTitleTests(unittest.TestCase):
             check=True,
         )
         session_id = "worktree-title"
+        # 旧版遗留的前缀写法也能解析，但输出只保留三段
         self.write_title(
             session_id,
-            "[工作树] 开发中｜会话标题插件｜验证工作树前缀",
+            "[工作树] 开发中｜会话标题插件｜去掉工作树前缀",
         )
 
         result = self.run_hook("UserPromptSubmit", session_id, cwd=worktree)
 
         self.assertEqual(
             self.hook_output(result)["sessionTitle"],
-            "[工作树] 开发中｜会话标题插件｜验证工作树前缀",
+            "开发中｜会话标题插件｜去掉工作树前缀",
         )
-        # 桌面端按文件内容原样改名，提示里必须要求 Agent 自带前缀
-        self.assertIn(
-            "「[工作树] 状态｜初始需求｜当前进展」",
-            self.hook_output(result)["additionalContext"],
-        )
+        context = self.hook_output(result)["additionalContext"]
+        self.assertIn("「状态｜初始需求｜当前进展」", context)
+        self.assertNotIn("工作树", context)
 
     def establish_baseline(self, session_id: str, title: str) -> None:
         self.write_title(session_id, title)

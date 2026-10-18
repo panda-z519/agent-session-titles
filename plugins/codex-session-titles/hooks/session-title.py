@@ -22,8 +22,9 @@ from typing import Any, TextIO
 DEFAULT_LANGUAGE = "zh"
 SUPPORTED_LANGUAGES = {"zh", "en"}
 VALID_STATUSES = {
-    "zh": {"摸底", "方案", "开发中", "测试", "修复", "待确认", "已完成", "搁置"},
+    "zh": {"聊天", "摸底", "方案", "开发中", "测试", "修复", "待确认", "已完成", "搁置"},
     "en": {
+        "Chatting",
         "Scoping",
         "Planning",
         "Building",
@@ -34,11 +35,24 @@ VALID_STATUSES = {
         "Paused",
     },
 }
+STATUS_GUIDANCE = {
+    "zh": "状态从聊天、摸底、方案、开发中、测试、修复、待确认、已完成、搁置中选择，"
+    "闲聊或问答、不需要动手干活时用「聊天」。",
+    "en": "Choose Status from Chatting, Scoping, Planning, Building, Testing, Fixing, "
+    "Awaiting confirmation, Completed, or Paused; use Chatting for casual conversation or "
+    "Q&A that needs no hands-on work. ",
+}
+# 上次写入被拒时提醒 Agent 改写，否则它不知道标题没生效
+INVALID_TITLE_FEEDBACK = {
+    "zh": "上次写入的标题格式或状态词不合规，未生效；请按上述格式和状态词重新写入。",
+    "en": " The last title written was rejected because its format or status word is "
+    "invalid; rewrite it using the format and status words above.",
+}
 TITLE_SEGMENTS = ("status", "initial_request", "progress")
 TITLE_SEPARATORS = {"zh": "｜", "en": " | "}
-WORKTREE_PREFIXES = {"zh": "[工作树] ", "en": "[worktree] "}
 PROJECTLESS_TITLES = {"zh": "摸底｜新会话", "en": "Scoping | New session"}
 NO_BRANCH_NAMES = {"zh": "无分支", "en": "no branch"}
+# 旧版曾给工作树会话加前缀；解析时仍去掉，兼容已有标题。
 WORKTREE_PREFIX_PATTERN = re.compile(r"^(?:(?:\[工作树\]|\[worktree\])\s*)+")
 SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 PHASE_INITIALIZING = "initializing"
@@ -70,23 +84,14 @@ def read_language(config_file: Path) -> str:
     return config["language"]
 
 
-def project_context(cwd: str, language: str) -> tuple[bool, str, str, str]:
-    worktree_prefix = ""
+def project_context(cwd: str, language: str) -> tuple[bool, str, str]:
     try:
-        git_dir = subprocess.check_output(
-            ["git", "-C", cwd, "rev-parse", "--git-dir"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
         common_dir = subprocess.check_output(
             ["git", "-C", cwd, "rev-parse", "--git-common-dir"],
             stderr=subprocess.DEVNULL,
             text=True,
         ).strip()
-        git_path = Path(cwd, git_dir).resolve()
         common_path = Path(cwd, common_dir).resolve()
-        if git_path != common_path:
-            worktree_prefix = WORKTREE_PREFIXES[language]
         project = common_path.parent.name
         branch = subprocess.check_output(
             ["git", "-C", cwd, "branch", "--show-current"],
@@ -94,8 +99,8 @@ def project_context(cwd: str, language: str) -> tuple[bool, str, str, str]:
             text=True,
         ).strip() or NO_BRANCH_NAMES[language]
     except (OSError, subprocess.CalledProcessError):
-        return False, "", "", ""
-    return True, worktree_prefix, project, branch
+        return False, "", ""
+    return True, project, branch
 
 
 def read_thread_name(database: Path, session_id: str) -> tuple[str, str]:
@@ -560,13 +565,13 @@ def parse_three_part_title(value: Any) -> tuple[str, str, tuple[str, str, str]] 
     return matches[0] if len(matches) == 1 else None
 
 
-def format_requested_title(value: str, worktree_prefix: str, language: str) -> str:
+def format_requested_title(value: str, language: str) -> str:
     title = WORKTREE_PREFIX_PATTERN.sub("", value).strip()
     separator = TITLE_SEPARATORS[language]
     parts = tuple(part.strip() for part in title.split(separator))
     if len(parts) != 3 or any(not part for part in parts):
         return ""
-    return f"{worktree_prefix}{separator.join(parts)}"[:60]
+    return separator.join(parts)[:60]
 
 
 def protected_segments(state: dict[str, Any]) -> set[str]:
@@ -764,7 +769,6 @@ def apply_requested_title(
     database: Path,
     state_file: Path,
     title_file: Path,
-    worktree_prefix: str,
     fallback_title: str,
     language: str,
 ) -> str:
@@ -805,7 +809,7 @@ def apply_requested_title(
     requested = (
         fallback_title
         if use_fallback
-        else format_requested_title(file_content, worktree_prefix, language)
+        else format_requested_title(file_content, language)
     )
     if not requested:
         state["last_result"] = "invalid_title"
@@ -850,6 +854,18 @@ def apply_requested_title(
     return result
 
 
+def title_file_rejected(state: dict[str, Any], title_file: Path, language: str) -> bool:
+    """标题文件仍在且内容不合规：被拒的文件会保留到改正为止，据此提醒 Agent 重写。
+
+    不依赖 last_result，因为初始化阶段的后续事件会覆盖它。
+    """
+    file_result, file_content, _ = read_requested_title(title_file)
+    if file_result != "ok":
+        return False
+    requested = format_requested_title(file_content, language)
+    return not requested or not automatic_status_is_valid(state, requested, language)
+
+
 def context_for_state(
     state: dict[str, Any] | None,
     phase_result: str,
@@ -857,6 +873,11 @@ def context_for_state(
     title_file: Path,
     language: str,
 ) -> str:
+    invalid = (
+        INVALID_TITLE_FEEDBACK[language]
+        if state and title_file_rejected(state, title_file, language)
+        else ""
+    )
     if language == "en":
         if phase_result == PHASE_SOURCE_UNCONFIRMED or (
             state and state.get("phase") == PHASE_SOURCE_UNCONFIRMED
@@ -887,12 +908,13 @@ def context_for_state(
                 f"Current name: {current or 'Codex has not generated an initial title yet'}; "
                 f"title file: {title_file}. As soon as you understand the initial request, "
                 "use a file-writing tool to write one line in the format "
-                '"Status | Initial request | Current progress". Choose Status from Scoping, '
-                "Planning, Building, Testing, Fixing, Awaiting confirmation, Completed, or "
-                "Paused. Keep the middle part unchanged once it captures the user's initial "
-                "request, and update the final part whenever the phase or progress changes. "
-                "Write during the work instead of waiting for the final response. The hook "
-                "synchronizes after the file-writing tool completes."
+                '"Status | Initial request | Current progress". '
+                f"{STATUS_GUIDANCE['en']}Keep the middle part unchanged once it captures the "
+                "user's initial request, and update the final part whenever the phase or "
+                "progress changes. Write during the work instead of waiting for the final "
+                "response; even if this turn is only conversation and uses no other tool, "
+                "write the file once before replying. The hook synchronizes after the "
+                f"file-writing tool completes.{invalid}"
             )
         if state.get("phase") == PHASE_RETRYABLE_ERROR:
             return (
@@ -903,11 +925,11 @@ def context_for_state(
         return (
             f"Current session name: {current}; title file: {title_file}. When the topic or phase "
             "changes significantly, use a file-writing tool to write one line in the format "
-            '"Status | Initial request | Current progress". Choose Status from Scoping, '
-            "Planning, Building, Testing, Fixing, Awaiting confirmation, Completed, or Paused. "
-            "Keep the middle part unchanged once it captures the user's initial request, and "
-            "update the final part with the current progress. Write during the work instead of "
-            "waiting for the final response; do not rewrite an accurate title."
+            '"Status | Initial request | Current progress". '
+            f"{STATUS_GUIDANCE['en']}Keep the middle part unchanged once it captures the "
+            "user's initial request, and update the final part with the current progress. "
+            "Write during the work instead of waiting for the final response; do not rewrite "
+            f"an accurate title.{invalid}"
         )
 
     if phase_result == PHASE_SOURCE_UNCONFIRMED or (state and state.get("phase") == PHASE_SOURCE_UNCONFIRMED):
@@ -929,9 +951,11 @@ def context_for_state(
             f"{prompt}初始化中：等待 Codex 初始标题稳定。"
             f"当前名称：{current or 'Codex 尚未生成初始标题'}；标题文件：{title_file}。"
             "一旦理解用户的初始需求，就用写入文件的工具写一行"
-            "「状态｜初始需求｜当前进展」；阶段或进展变化时及时更新末段。"
+            f"「状态｜初始需求｜当前进展」；{STATUS_GUIDANCE['zh']}"
+            "阶段或进展变化时及时更新末段。"
             "中间段概括用户最初要解决的问题并保持不变。"
-            "在工作过程中写入，不要等最终回复；写入工具完成后钩子会立即同步。"
+            "在工作过程中写入，不要等最终回复；即使本轮只是聊天、只回复不用其他工具，"
+            f"也要在回复前先写一次。写入工具完成后钩子会立即同步。{invalid}"
         )
     if state.get("phase") == PHASE_RETRYABLE_ERROR:
         return (
@@ -942,9 +966,9 @@ def context_for_state(
     return (
         f"当前会话名：{current}；标题文件：{title_file}。"
         "主题或阶段明显变化时，"
-        "用写入文件的工具写一行「状态｜初始需求｜当前进展」。"
+        f"用写入文件的工具写一行「状态｜初始需求｜当前进展」；{STATUS_GUIDANCE['zh']}"
         "中间段概括用户最初要解决的问题并保持不变；末段概括目前进展。"
-        "在工作过程中及时写入，不要等最终回复；标题仍准确时不要重复写。"
+        f"在工作过程中及时写入，不要等最终回复；标题仍准确时不要重复写。{invalid}"
     )
 
 
@@ -1016,11 +1040,11 @@ def run_session_transaction(payload: dict[str, Any]) -> int:
         )
         return 0
 
-    has_project, worktree_prefix, project, branch = project_context(
+    has_project, project, branch = project_context(
         payload.get("cwd") or os.getcwd(), language
     )
     fallback_title = (
-        f"{worktree_prefix}{project}·{branch}"
+        f"{project}·{branch}"
         if has_project
         else PROJECTLESS_TITLES[language]
     )
@@ -1148,7 +1172,6 @@ def run_session_transaction(payload: dict[str, Any]) -> int:
                 database,
                 state_file,
                 title_file,
-                worktree_prefix,
                 fallback_title,
                 language,
             )
@@ -1164,7 +1187,6 @@ def run_session_transaction(payload: dict[str, Any]) -> int:
                 database,
                 state_file,
                 title_file,
-                worktree_prefix,
                 fallback_title,
                 language,
             )
@@ -1200,7 +1222,6 @@ def run_session_transaction(payload: dict[str, Any]) -> int:
             database,
             state_file,
             title_file,
-            worktree_prefix,
             fallback_title,
             language,
         )
@@ -1218,7 +1239,6 @@ def run_session_transaction(payload: dict[str, Any]) -> int:
             database,
             state_file,
             title_file,
-            worktree_prefix,
             fallback_title,
             language,
         )

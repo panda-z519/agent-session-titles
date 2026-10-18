@@ -354,6 +354,28 @@ class SessionTitleStateTests(unittest.TestCase):
         self.assertEqual(self.read_state(session_id)["last_result"], "invalid_title")
         self.assertTrue(self.title_path(session_id).exists())
 
+    def test_chinese_context_lists_statuses_and_reports_rejected_title(self) -> None:
+        # 复现真实会话：中文提示不列状态词，Agent 写了「进行中」被静默拒绝
+        session_id = "chat-invalid-status"
+        self.add_thread(session_id)
+        start = self.run_hook("SessionStart", session_id, "startup")
+        context = start["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("状态从聊天、摸底、方案", context)
+        self.assertIn("即使本轮只是聊天", context)
+
+        self.write_title(session_id, "进行中｜聊聊身体近况｜已收到近况")
+        self.set_name(session_id, "记录近期身体状况")
+        self.run_hook("PostToolUse", session_id)
+        self.assertEqual(self.read_state(session_id)["last_result"], "invalid_title")
+        prompt = self.run_hook("UserPromptSubmit", session_id)
+        self.assertIn("未生效", prompt["hookSpecificOutput"]["additionalContext"])
+
+        self.write_title(session_id, "聊天｜聊聊身体近况｜已收到近况")
+        self.run_hook("PostToolUse", session_id)
+        self.assertEqual(self.get_name(session_id), "聊天｜聊聊身体近况｜已收到近况")
+        after = self.run_hook("UserPromptSubmit", session_id)
+        self.assertNotIn("未生效", after["hookSpecificOutput"]["additionalContext"])
+
     def test_database_write_failure_keeps_title_for_retry(self) -> None:
         session_id = "retry-session"
         self.add_thread(session_id, "App 初始标题")
@@ -380,7 +402,7 @@ class SessionTitleStateTests(unittest.TestCase):
         self.assertFalse(self.title_path(session_id).exists())
         self.assertIsNone(self.read_state(session_id).get("pending_update"))
 
-    def test_worktree_prefix_is_kept_when_applying_file_title(self) -> None:
+    def test_worktree_session_uses_plain_three_part_title(self) -> None:
         repo = self.root / "repo"
         worktree = self.root / "worktree"
         repo.mkdir()
@@ -397,9 +419,10 @@ class SessionTitleStateTests(unittest.TestCase):
         session_id = "worktree-session"
         self.add_thread(session_id, "Codex 自动标题")
         self.run_hook("SessionStart", session_id, "startup", worktree)
-        self.write_title(session_id, "开发中｜会话标题自动化｜工作树标题同步")
+        # 旧版遗留的前缀写法也能解析，但应用后只保留三段
+        self.write_title(session_id, "[工作树] 开发中｜会话标题自动化｜工作树标题同步")
         self.run_hook("Stop", session_id, cwd=worktree)
-        self.assertEqual(self.get_name(session_id), "[工作树] 开发中｜会话标题自动化｜工作树标题同步")
+        self.assertEqual(self.get_name(session_id), "开发中｜会话标题自动化｜工作树标题同步")
 
     def test_requested_title_requires_three_nonempty_parts(self) -> None:
         session_id = "three-part-title"

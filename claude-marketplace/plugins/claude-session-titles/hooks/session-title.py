@@ -6,7 +6,6 @@ import fcntl
 import json
 import os
 import re
-import subprocess
 import sys
 import tempfile
 import time
@@ -19,6 +18,7 @@ VALID_EVENTS = {"SessionStart", "UserPromptSubmit"}
 DEFAULT_LANGUAGE = "zh"
 VALID_STATUSES = {
     "zh": {
+        "聊天",
         "摸底",
         "方案",
         "开发中",
@@ -29,6 +29,7 @@ VALID_STATUSES = {
         "搁置",
     },
     "en": {
+        "Chatting",
         "Scoping",
         "Planning",
         "Building",
@@ -40,7 +41,6 @@ VALID_STATUSES = {
     },
 }
 TITLE_SEPARATORS = {"zh": "｜", "en": " | "}
-WORKTREE_PREFIXES = {"zh": "[工作树] ", "en": "[worktree] "}
 INITIAL_STATUSES = {"zh": "摸底", "en": "Scoping"}
 INITIAL_PROGRESS = {"zh": "分析首条请求", "en": "Reviewing first request"}
 GENERIC_INITIAL_REQUEST = {"zh": "处理首条请求", "en": "Handle first request"}
@@ -50,7 +50,12 @@ PART_NAMES = {
 }
 SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 CONTROL_CHARACTER_PATTERN = re.compile(r"[\x00-\x1f\x7f]")
+# 旧版曾给工作树会话加前缀；解析时仍去掉，兼容已有标题。
 WORKTREE_PREFIX_PATTERN = re.compile(r"^(?:(?:\[工作树\]|\[worktree\])\s*)+")
+# 桌面端会在用户原话前插入系统提醒块，取首行前先去掉，避免误判为标签或私有路径。
+LEADING_SYSTEM_REMINDER_PATTERN = re.compile(
+    r"^(?:\s*<system-reminder>.*?</system-reminder>)+\s*", re.DOTALL
+)
 MARKDOWN_PREFIX_PATTERN = re.compile(r"^(?:#{1,6}|[-*>])\s*")
 CJK_CHARACTER_PATTERN = re.compile(r"[぀-ヿ㐀-䶿一-鿿가-힯]")
 SENSITIVE_PROMPT_PATTERN = re.compile(
@@ -152,8 +157,8 @@ def parse_title(value: str, language: str) -> list[str] | None:
     return parts
 
 
-def format_title(parts: list[str], language: str, prefix: str = "") -> str:
-    return f"{prefix}{TITLE_SEPARATORS[language].join(parts)}"
+def format_title(parts: list[str], language: str) -> str:
+    return TITLE_SEPARATORS[language].join(parts)
 
 
 def read_requested_title(path: Path, language: str) -> tuple[str, list[str] | None]:
@@ -319,39 +324,11 @@ def current_custom_title(payload: dict[str, Any]) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
-def resolve_git_path(cwd: Path, value: str) -> Path:
-    path = Path(value)
-    return (path if path.is_absolute() else cwd / path).resolve()
-
-
-def git_path(cwd: Path, argument: str) -> Path | None:
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(cwd), "rev-parse", argument],
-            text=True,
-            capture_output=True,
-            check=True,
-            timeout=2,
-        )
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return None
-    value = result.stdout.strip()
-    return resolve_git_path(cwd, value) if value else None
-
-
-def worktree_prefix(cwd_value: Any, language: str) -> str:
-    cwd = Path(cwd_value) if isinstance(cwd_value, str) and cwd_value else Path.cwd()
-    git_directory = git_path(cwd, "--git-dir")
-    common_directory = git_path(cwd, "--git-common-dir")
-    if git_directory is None or common_directory is None:
-        return ""
-    return WORKTREE_PREFIXES[language] if git_directory != common_directory else ""
-
-
 def extract_initial_request(prompt_value: Any, language: str) -> str:
     fallback = GENERIC_INITIAL_REQUEST[language]
     if not isinstance(prompt_value, str):
         return fallback
+    prompt_value = LEADING_SYSTEM_REMINDER_PATTERN.sub("", prompt_value)
     if (
         "<pasted_content" in prompt_value
         or SENSITIVE_PROMPT_PATTERN.search(prompt_value)
@@ -403,14 +380,16 @@ def writing_guidance(
     title_file: Path,
     language: str,
     state: dict[str, Any] | None = None,
-    prefix: str = "",
 ) -> str:
     lock_context = locked_part_context(state, language) if state is not None else ""
-    provisional = bool(state and state["middle_provisional"])
+    # 还没有状态的全新会话也没有初始需求，按临时短名提示
+    provisional = state is None or state["middle_provisional"]
     if language == "en":
         provisional_context = (
             "The initial-request part is provisional and may be refined once from the "
-            "current task, then it becomes fixed. "
+            "current task, then it becomes fixed. This session has no confirmed title yet: "
+            "write the file once before replying, even if this turn is only conversation "
+            "and uses no other tool. "
             if provisional
             else "Keep the established initial-request part unchanged. "
         )
@@ -418,25 +397,28 @@ def writing_guidance(
             f"Session title file: {title_file}. {lock_context}{provisional_context}When the "
             "phase or progress changes, overwrite this file with the Write tool as early as "
             'possible in the turn with one line in the form "'
-            f'{prefix}Status | Initial request | Current progress". The desktop app applies '
+            'Status | Initial request | Current progress". The desktop app applies '
             "it immediately; the CLI applies it on the next UserPromptSubmit. For unlocked "
-            "automatic status updates, use Scoping, Planning, Building, Testing, Fixing, "
-            "Awaiting confirmation, Completed, or Paused. Preserve locked parts; a manually "
+            "automatic status updates, use Chatting, Scoping, Planning, Building, Testing, "
+            "Fixing, Awaiting confirmation, Completed, or Paused; use Chatting for casual "
+            "conversation or Q&A that needs no hands-on work. Preserve locked parts; a manually "
             "locked status may use other words. No write is needed while the title is "
             "accurate. Do not mention title updates to the user."
         )
     provisional_context = (
         "初始需求目前只是临时短名，可根据本轮真实任务精炼一次，"
-        "随后固定。"
+        "随后固定。本会话还没有正式标题：即使只是聊天、"
+        "只回复不用其他工具，也要在回复前先写一次。"
         if provisional
         else "已建立的初始需求保持不变。"
     )
     return (
         f"会话标题文件：{title_file}。{lock_context}{provisional_context}"
         "阶段或进展变化时，在本轮尽早用 Write 工具覆盖写入一行"
-        f"「{prefix}状态｜初始需求｜当前进展」；桌面端写入后立即生效，"
-        "命令行在下一次提交消息时应用。未锁定的自动状态更新从摸底、方案、"
-        "开发中、测试、修复、待确认、已完成、搁置中选择。"
+        "「状态｜初始需求｜当前进展」；桌面端写入后立即生效，"
+        "命令行在下一次提交消息时应用。未锁定的自动状态更新从聊天、摸底、方案、"
+        "开发中、测试、修复、待确认、已完成、搁置中选择；"
+        "闲聊或问答、不需要动手干活时用「聊天」。"
         "保留已锁定字段；人工锁定的状态可用其他词。"
         "标题仍准确时不要写，写入时不要向用户提起。"
     )
@@ -725,7 +707,6 @@ def process_session_start(
     language: str,
 ) -> None:
     current = current_custom_title(payload)
-    prefix = worktree_prefix(payload.get("cwd"), language)
     result, state = resolve_state(
         session_id, language, state_file, applied_file, current
     )
@@ -741,7 +722,7 @@ def process_session_start(
                 return
             emit("SessionStart", context=protected_context(language))
             return
-        emit("SessionStart", context=writing_guidance(title_file, language, prefix=prefix))
+        emit("SessionStart", context=writing_guidance(title_file, language))
         return
 
     _, file_parts = read_requested_title(title_file, language)
@@ -757,7 +738,7 @@ def process_session_start(
     if state["whole_name_protected"]:
         emit("SessionStart", context=protected_context(language))
         return
-    context = writing_guidance(title_file, language, state, prefix)
+    context = writing_guidance(title_file, language, state)
     if not legacy_saved:
         context += (
             " Legacy .applied compatibility data will be retried later."
@@ -776,7 +757,6 @@ def process_user_prompt(
     language: str,
 ) -> None:
     current = current_custom_title(payload)
-    prefix = worktree_prefix(payload.get("cwd"), language)
     result, state = resolve_state(
         session_id, language, state_file, applied_file, current
     )
@@ -827,7 +807,7 @@ def process_user_prompt(
         else:
             emit(
                 "UserPromptSubmit",
-                context=writing_guidance(title_file, language, state, prefix),
+                context=writing_guidance(title_file, language, state),
             )
             return
 
@@ -871,7 +851,7 @@ def process_user_prompt(
             if not write_state(state_file, state):
                 emit("UserPromptSubmit", context=io_error_context(language))
                 return
-        context = writing_guidance(title_file, language, state, prefix)
+        context = writing_guidance(title_file, language, state)
         if not legacy_saved:
             context += (
                 " Legacy .applied compatibility data will be retried later."
@@ -892,11 +872,11 @@ def process_user_prompt(
     if not write_state(state_file, state):
         emit("UserPromptSubmit", context=io_error_context(language))
         return
-    desired_title = format_title(desired, language, prefix)
+    desired_title = format_title(desired, language)
     emit(
         "UserPromptSubmit",
         title=desired_title,
-        context=writing_guidance(title_file, language, state, prefix),
+        context=writing_guidance(title_file, language, state),
     )
 
 

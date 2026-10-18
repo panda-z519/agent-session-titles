@@ -1,6 +1,6 @@
 {
   "name": "codex-session-titles",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "description": "为 Codex 本地会话自动维护可选中英文的三段式标题。",
   "license": "MIT",
   "hooks": "./hooks/hooks.json",

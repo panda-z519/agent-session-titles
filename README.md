@@ -84,7 +84,7 @@ npx --yes github:panda-z519/agent-session-titles --remove-rules
 
 1. 重启客户端，新建一个**本地会话**，提出具体需求。助手理解需求后应尽早形成三段标题，阶段明显变化时更新状态与进展。
 2. 分别手动修改一段标题，再让助手进入下一阶段；手动改过的段应保持原样，其他段继续更新。若把整条标题改为无法拆分的格式，插件应保留整条名称；再改回合法的三段格式后，插件恢复自动更新（中间段锁定）。
-3. Codex 在标题文件写入后的工具事件尽早同步；`Stop` 和下一次发消息仍负责补偿。可检查 `~/.codex/session-titles/<会话ID>.state.json` 的 `phase`、`last_result` 和分段锁定信息。Codex CLI 使用后台守护进程（app-server daemon）时，插件经它的控制套接字调用 `thread/name/set`，已打开的 CLI 窗口会立即刷新状态栏标题；守护进程不可用（例如 `--no-daemon`）时退回直接写 SQLite，此时已打开的窗口要到重新打开或 `/rename` 后才显示新标题。侧边栏即时刷新仍取决于桌面端。
+3. Codex 在标题文件写入后的工具事件尽早同步，即使 Codex 此时还没给会话起名；若 Codex 首轮结束后自动生成的名字覆盖了插件标题，下一次发消息时会恢复一次。`Stop` 和下一次发消息仍负责补偿。可检查 `~/.codex/session-titles/<会话ID>.state.json` 的 `phase`、`last_result` 和分段锁定信息。Codex CLI 使用后台守护进程（app-server daemon）时，插件经它的控制套接字调用 `thread/name/set`，已打开的 CLI 窗口会立即刷新状态栏标题；守护进程不可用（例如 `--no-daemon`）时退回直接写 SQLite，此时已打开的窗口要到重新打开或 `/rename` 后才显示新标题。侧边栏即时刷新仍取决于桌面端。
 4. Claude Code 首条提示词通过官方 `sessionTitle` 钩子输出形成初始标题。**桌面端**在 Agent 写入标题文件后由 `PostToolUse` 钩子调用桌面端改名工具**立即**生效；**命令行**没有该工具，后续进展在下一次提交消息时应用（`PostToolUse` 钩子会报一条不影响流程的错误）。可检查 `~/.cc-session-titles/<会话ID>.txt`。[Claude 钩子说明](https://code.claude.com/docs/en/hooks)
 
 历史会话在收到新消息后才重新纳入 Codex 标题管理。若钩子提示“来源未确认”，会保留已有名称。无项目会话使用需求摘要，不把当前目录冒充项目名。

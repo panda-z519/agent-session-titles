@@ -1,6 +1,6 @@
 {
   "name": "agent-session-titles",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "description": "安装支持中英文的 Codex 与 Claude Code 本地会话标题插件",
   "license": "MIT",
   "repository": {

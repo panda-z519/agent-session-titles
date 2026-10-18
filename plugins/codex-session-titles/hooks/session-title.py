@@ -343,6 +343,8 @@ def load_state(state_file: Path) -> tuple[str, dict[str, Any] | None]:
         )
     if "initial_takeover_pending" not in state:
         state["initial_takeover_pending"] = False
+    if "auto_name_guard" not in state:
+        state["auto_name_guard"] = False
     return "ok", state
 
 
@@ -435,6 +437,7 @@ def new_initial_state(
         "segment_protection_active": False,
         "locked_segments": [],
         "initial_takeover_pending": False,
+        "auto_name_guard": False,
         "pending_update": None,
         "last_result": result if result != "ok" else RESULT_INITIAL_TITLE_PENDING,
         "last_error": None,
@@ -454,6 +457,7 @@ def managed_state(session_id: str, name: str, result: str) -> dict[str, Any]:
         "segment_protection_active": segment_protection_active,
         "locked_segments": ["initial_request"] if segment_protection_active else [],
         "initial_takeover_pending": False,
+        "auto_name_guard": False,
         "pending_update": None,
         "last_result": result,
         "last_error": None,
@@ -762,6 +766,38 @@ def recover_pending_update(
         state["phase"] = PHASE_RETRYABLE_ERROR
     write_state(state_file, state)
     return result
+
+
+def restore_after_codex_auto_name(
+    state: dict[str, Any],
+    database: Path,
+    state_file: Path,
+    event: str,
+) -> None:
+    """插件在 Codex 起名前接管时，Codex 首轮后生成的名字可能覆盖插件标题，恢复一次。"""
+    result, current = read_thread_name(database, state["session_id"])
+    if result != "ok":
+        return
+    expected = state.get("last_applied_name")
+    if current == expected:
+        # 新一轮提交时首轮后的自动起名窗口已过，名称仍是插件标题即解除守护
+        if event == "UserPromptSubmit":
+            state["auto_name_guard"] = False
+            write_state(state_file, state)
+        return
+    state["auto_name_guard"] = False
+    # 只恢复被非三段名称覆盖的情况；三段名称更可能是用户手动改的，交给常规对账
+    if (
+        current
+        and isinstance(expected, str)
+        and expected
+        and parse_three_part_title(current) is None
+        and compare_and_set_thread_name(database, state["session_id"], current, expected)
+        == RESULT_UPDATED
+    ):
+        state["last_result"] = "auto_name_restored"
+        state["last_error"] = None
+    write_state(state_file, state)
 
 
 def apply_requested_title(
@@ -1136,6 +1172,9 @@ def run_session_transaction(payload: dict[str, Any]) -> int:
                 )
             return 0
 
+    if state.get("auto_name_guard") and state.get("phase") == PHASE_MANAGED:
+        restore_after_codex_auto_name(state, database, state_file, event)
+
     if state.get("phase") == PHASE_INITIALIZING:
         current_result, current = read_thread_name(database, session_id)
         if current_result != "ok":
@@ -1155,8 +1194,11 @@ def run_session_transaction(payload: dict[str, Any]) -> int:
                     language,
                 )
             return 0
-        if title_file.exists() and current and event in {"PostToolUse", "Stop"}:
+        if title_file.exists() and event in {"PostToolUse", "Stop"}:
             # 明确的三段标题意图已到达；以此刻可见名称为 CAS 基线直接接管。
+            # Codex CLI 在首轮结束后才异步生成名字，此时名称可能仍为空：照样接管，
+            # 并标记守护，若随后生成的名字覆盖了插件标题，下一事件恢复一次。
+            state["auto_name_guard"] = not current
             state["candidate_name"] = current
             state["last_applied_name"] = current
             state["segment_protection_active"] = False

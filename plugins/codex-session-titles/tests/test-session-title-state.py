@@ -216,6 +216,40 @@ class SessionTitleStateTests(unittest.TestCase):
         self.assertEqual(state["phase"], "managed")
         self.assertEqual(state["last_result"], "updated")
 
+    def test_title_file_before_codex_names_thread_is_applied_and_survives_auto_name(self) -> None:
+        # 复现 CLI 真实时序：Agent 写入标题时 Codex 尚未起名，首轮结束后才生成名字
+        session_id = "title-before-auto-name"
+        self.add_thread(session_id)
+        self.run_hook("SessionStart", session_id, "startup")
+        self.write_title(session_id, "聊天｜聊聊今天的状态｜轻松回应")
+        self.run_hook("PostToolUse", session_id)
+        self.assertEqual(self.get_name(session_id), "聊天｜聊聊今天的状态｜轻松回应")
+        self.assertTrue(self.read_state(session_id)["auto_name_guard"])
+
+        self.run_hook("Stop", session_id)
+        self.set_name(session_id, "记录今日状态")
+        self.run_hook("UserPromptSubmit", session_id)
+
+        self.assertEqual(self.get_name(session_id), "聊天｜聊聊今天的状态｜轻松回应")
+        state = self.read_state(session_id)
+        self.assertEqual(state["phase"], "managed")
+        self.assertFalse(state["auto_name_guard"])
+        # 守护只生效一次，之后的外部改名仍按原规则保护
+        self.set_name(session_id, "用户手动改名")
+        self.run_hook("UserPromptSubmit", session_id)
+        self.assertEqual(self.get_name(session_id), "用户手动改名")
+
+    def test_auto_name_guard_clears_when_codex_does_not_overwrite(self) -> None:
+        session_id = "guard-no-overwrite"
+        self.add_thread(session_id)
+        self.run_hook("SessionStart", session_id, "startup")
+        self.write_title(session_id, "开发中｜会话标题自动化｜接管空名称")
+        self.run_hook("PostToolUse", session_id)
+        self.run_hook("UserPromptSubmit", session_id)
+
+        self.assertEqual(self.get_name(session_id), "开发中｜会话标题自动化｜接管空名称")
+        self.assertFalse(self.read_state(session_id)["auto_name_guard"])
+
     def test_missing_thread_record_retries_without_losing_title(self) -> None:
         session_id = "late-thread"
         start = self.run_hook("SessionStart", session_id, "startup")

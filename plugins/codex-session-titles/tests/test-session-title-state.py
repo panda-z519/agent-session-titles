@@ -2,11 +2,16 @@
 """在隔离的临时 Codex 状态库中验证标题管理状态机。"""
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
+import socket
 import sqlite3
+import struct
 import subprocess
 import tempfile
+import threading
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -14,6 +19,95 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 HOOK = ROOT.parent / "hooks" / "session-title.sh"
+# RFC 6455 固定值；下方测试用 RFC 示例校验，避免钩子和模拟服务端共用同一个错误常量。
+WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+class FakeAppServer:
+    """模拟 Codex 后台 app-server 的控制套接字：WebSocket 握手后处理 JSON-RPC。"""
+
+    def __init__(self, socket_path: Path, database: Path, fail_rename: bool = False) -> None:
+        self.database = database
+        self.fail_rename = fail_rename
+        self.calls: list[tuple[str, dict]] = []
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.bind(str(socket_path))
+        self.listener.listen(4)
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+        self.thread.start()
+
+    def close(self) -> None:
+        self.listener.close()
+
+    def serve(self) -> None:
+        while True:
+            try:
+                connection, _ = self.listener.accept()
+            except OSError:
+                return
+            with connection:
+                try:
+                    self.handle(connection)
+                except (OSError, EOFError):
+                    pass
+
+    @staticmethod
+    def recv_exact(connection: socket.socket, size: int) -> bytes:
+        data = b""
+        while len(data) < size:
+            chunk = connection.recv(size - len(data))
+            if not chunk:
+                raise EOFError
+            data += chunk
+        return data
+
+    def handle(self, connection: socket.socket) -> None:
+        request = b""
+        while b"\r\n\r\n" not in request:
+            request += connection.recv(4096)
+        key = next(
+            line.split(b":", 1)[1].strip()
+            for line in request.split(b"\r\n")
+            if line.lower().startswith(b"sec-websocket-key:")
+        )
+        accept = base64.b64encode(hashlib.sha1(key + WEBSOCKET_GUID.encode()).digest())
+        connection.sendall(
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+            b"Connection: Upgrade\r\nSec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+        )
+        while True:
+            first, second = self.recv_exact(connection, 2)
+            size = second & 0x7F
+            if size == 126:
+                size = struct.unpack("!H", self.recv_exact(connection, 2))[0]
+            mask = self.recv_exact(connection, 4)
+            payload = bytes(
+                byte ^ mask[index % 4]
+                for index, byte in enumerate(self.recv_exact(connection, size))
+            )
+            message = json.loads(payload)
+            method = message.get("method")
+            self.calls.append((method, message.get("params") or {}))
+            if "id" not in message:
+                continue
+            # 先插入一条无关广播，验证客户端只认自己请求的响应。
+            self.send(connection, {"method": "remoteControl/status/changed", "params": {}})
+            if method == "thread/name/set":
+                if self.fail_rename:
+                    self.send(connection, {"id": message["id"], "error": {"message": "boom"}})
+                    continue
+                params = message["params"]
+                with closing(sqlite3.connect(self.database)) as db, db:
+                    db.execute(
+                        "UPDATE threads SET name = ? WHERE id = ?",
+                        (params["name"], params["threadId"]),
+                    )
+            self.send(connection, {"id": message["id"], "result": {}})
+
+    @staticmethod
+    def send(connection: socket.socket, message: dict) -> None:
+        payload = json.dumps(message).encode()
+        connection.sendall(struct.pack("!BB", 0x81, len(payload)) + payload)
 
 
 class SessionTitleStateTests(unittest.TestCase):
@@ -323,6 +417,58 @@ class SessionTitleStateTests(unittest.TestCase):
             self.get_name(session_id),
             "开发中｜会话标题自动化｜保留最初需求名称",
         )
+        self.assertFalse(self.title_path(session_id).exists())
+
+    def start_fake_app_server(self, fail_rename: bool = False) -> FakeAppServer:
+        # Unix 套接字路径有长度上限，实际文件放在短路径，再像 Codex 一样用符号链接指过去。
+        socket_dir = Path(tempfile.mkdtemp(prefix="ast-", dir="/tmp"))
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(socket_dir)], check=False))
+        socket_path = socket_dir / "control.sock"
+        server = FakeAppServer(socket_path, self.database, fail_rename)
+        self.addCleanup(server.close)
+        control_dir = self.codex_home / "app-server-control"
+        control_dir.mkdir()
+        (control_dir / "app-server-control.sock").symlink_to(socket_path)
+        return server
+
+    def test_websocket_guid_matches_rfc_example(self) -> None:
+        accept = base64.b64encode(
+            hashlib.sha1(("dGhlIHNhbXBsZSBub25jZQ==" + WEBSOCKET_GUID).encode()).digest()
+        )
+        self.assertEqual(accept, b"s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+
+    def test_running_app_server_receives_rename_so_open_cli_refreshes(self) -> None:
+        session_id = "daemon-session"
+        self.add_thread(session_id, "Codex 自动标题")
+        server = self.start_fake_app_server()
+        self.run_hook("SessionStart", session_id, "startup")
+
+        self.write_title(session_id, "开发中｜会话标题自动化｜同步打开的终端窗口")
+        self.run_hook("PostToolUse", session_id)
+
+        self.assertIn(
+            ("thread/name/set", {
+                "threadId": session_id,
+                "name": "开发中｜会话标题自动化｜同步打开的终端窗口",
+            }),
+            server.calls,
+        )
+        self.assertEqual(server.calls[0][0], "initialize")
+        self.assertEqual(self.get_name(session_id), "开发中｜会话标题自动化｜同步打开的终端窗口")
+        self.assertFalse(self.title_path(session_id).exists())
+        self.assertEqual(self.read_state(session_id)["last_result"], "updated")
+
+    def test_app_server_error_falls_back_to_database(self) -> None:
+        session_id = "daemon-error-session"
+        self.add_thread(session_id, "Codex 自动标题")
+        server = self.start_fake_app_server(fail_rename=True)
+        self.run_hook("SessionStart", session_id, "startup")
+
+        self.write_title(session_id, "修复｜会话标题自动化｜服务端失败时兜底")
+        self.run_hook("Stop", session_id)
+
+        self.assertIn("thread/name/set", [method for method, _ in server.calls])
+        self.assertEqual(self.get_name(session_id), "修复｜会话标题自动化｜服务端失败时兜底")
         self.assertFalse(self.title_path(session_id).exists())
 
 

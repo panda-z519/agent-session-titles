@@ -2,11 +2,15 @@
 """在 Codex 生命周期钩子中观察初始标题并同步状态文件。"""
 from __future__ import annotations
 
+import base64
 import fcntl
+import hashlib
 import json
 import os
 import re
+import socket
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
@@ -51,6 +55,9 @@ RESULT_INITIAL_TITLE_TIMEOUT = "initial_title_timeout"
 INITIAL_EMPTY_STOP_LIMIT = 3
 SESSION_LOCK_TIMEOUT_SECONDS = 3.0
 SESSION_LOCK_POLL_SECONDS = 0.05
+APP_SERVER_TIMEOUT_SECONDS = 3.0
+APP_SERVER_MAX_MESSAGE_BYTES = 16 * 1024 * 1024
+WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
 def read_language(config_file: Path) -> str:
@@ -107,7 +114,171 @@ def read_thread_name(database: Path, session_id: str) -> tuple[str, str]:
         return RESULT_IO_ERROR, ""
 
 
+class AppServerUnavailable(Exception):
+    """后台 app-server 不可用或返回异常，调用方改用 SQLite 兜底。"""
+
+
+class AppServerConnection:
+    """通过 Codex 控制套接字（Unix 域套接字上的 WebSocket）发送 JSON-RPC 的最小客户端。"""
+
+    def __init__(self, socket_path: Path, timeout: float) -> None:
+        self.deadline = time.monotonic() + timeout
+        self.buffer = b""
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            self.sock.settimeout(timeout)
+            self.sock.connect(str(socket_path))
+            self._handshake()
+        except BaseException:
+            self.sock.close()
+            raise
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def _recv_some(self) -> None:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise AppServerUnavailable("timeout")
+        self.sock.settimeout(remaining)
+        chunk = self.sock.recv(65536)
+        if not chunk:
+            raise AppServerUnavailable("connection closed")
+        self.buffer += chunk
+
+    def _recv_exact(self, size: int) -> bytes:
+        while len(self.buffer) < size:
+            self._recv_some()
+        data, self.buffer = self.buffer[:size], self.buffer[size:]
+        return data
+
+    def _handshake(self) -> None:
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        self.sock.sendall(
+            (
+                "GET /rpc HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+                f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+                "Sec-WebSocket-Version: 13\r\n\r\n"
+            ).encode("ascii")
+        )
+        while b"\r\n\r\n" not in self.buffer:
+            if len(self.buffer) > 65536:
+                raise AppServerUnavailable("handshake too large")
+            self._recv_some()
+        head, self.buffer = self.buffer.split(b"\r\n\r\n", 1)
+        if head.split(b"\r\n", 1)[0].split()[1:2] != [b"101"]:
+            raise AppServerUnavailable("handshake rejected")
+        accept = base64.b64encode(
+            hashlib.sha1((key + WEBSOCKET_GUID).encode("ascii")).digest()
+        )
+        if accept not in head:
+            raise AppServerUnavailable("handshake accept mismatch")
+
+    def _send_frame(self, opcode: int, payload: bytes) -> None:
+        mask = os.urandom(4)
+        size = len(payload)
+        if size < 126:
+            header = struct.pack("!BB", 0x80 | opcode, 0x80 | size)
+        elif size < 65536:
+            header = struct.pack("!BBH", 0x80 | opcode, 0x80 | 126, size)
+        else:
+            header = struct.pack("!BBQ", 0x80 | opcode, 0x80 | 127, size)
+        masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        self.sock.sendall(header + mask + masked)
+
+    def send(self, message: dict[str, Any]) -> None:
+        self._send_frame(0x1, json.dumps(message, ensure_ascii=False).encode("utf-8"))
+
+    def _read_message(self) -> bytes:
+        fragments: list[bytes] = []
+        while True:
+            first, second = self._recv_exact(2)
+            opcode = first & 0x0F
+            size = second & 0x7F
+            if size == 126:
+                size = struct.unpack("!H", self._recv_exact(2))[0]
+            elif size == 127:
+                size = struct.unpack("!Q", self._recv_exact(8))[0]
+            if size > APP_SERVER_MAX_MESSAGE_BYTES:
+                raise AppServerUnavailable("message too large")
+            mask = self._recv_exact(4) if second & 0x80 else b""
+            payload = self._recv_exact(size)
+            if mask:
+                payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+            if opcode == 0x8:
+                raise AppServerUnavailable("connection closed")
+            if opcode == 0x9:
+                self._send_frame(0xA, payload)
+                continue
+            if opcode in {0x1, 0x2, 0x0}:
+                fragments.append(payload)
+                if first & 0x80:
+                    return b"".join(fragments)
+
+    def request(self, request_id: int, method: str, params: dict[str, Any]) -> Any:
+        self.send({"id": request_id, "method": method, "params": params})
+        while True:
+            try:
+                message = json.loads(self._read_message().decode("utf-8"))
+            except (UnicodeError, json.JSONDecodeError) as error:
+                raise AppServerUnavailable("invalid message") from error
+            # 其他会话的广播通知会混在同一连接里，只认本请求的响应。
+            if not isinstance(message, dict) or message.get("id") != request_id:
+                continue
+            if "error" in message or "result" not in message:
+                raise AppServerUnavailable("request failed")
+            return message["result"]
+
+
+def set_thread_name_via_app_server(codex_home: Path, session_id: str, name: str) -> bool:
+    """经正在运行的后台 app-server 改名，使已打开的 CLI 窗口收到 ThreadNameUpdated 通知。"""
+    # 控制套接字通常是指向短路径的符号链接；先解析，避免超出 Unix 套接字路径长度上限。
+    socket_path = (codex_home / "app-server-control" / "app-server-control.sock").resolve()
+    if not socket_path.exists():
+        return False
+    try:
+        connection = AppServerConnection(socket_path, APP_SERVER_TIMEOUT_SECONDS)
+    except (OSError, AppServerUnavailable):
+        return False
+    try:
+        connection.request(1, "initialize", {
+            "clientInfo": {
+                "name": "agent-session-titles",
+                "title": None,
+                "version": "1",
+            }
+        })
+        connection.send({"method": "initialized"})
+        connection.request(2, "thread/name/set", {"threadId": session_id, "name": name})
+        return True
+    except (OSError, AppServerUnavailable):
+        return False
+    finally:
+        connection.close()
+
+
 def compare_and_set_thread_name(
+    database: Path,
+    session_id: str,
+    expected: str,
+    desired: str,
+) -> str:
+    result, current = read_thread_name(database, session_id)
+    if result != "ok":
+        return result
+    if current != expected:
+        return RESULT_NAME_CONFLICT
+    # 优先交给后台 app-server：它同时更新状态库和会话索引，并通知已打开的 CLI 窗口刷新。
+    # 不能在持有 SQLite 写锁时调用，否则服务端写库会被本进程阻塞。
+    if set_thread_name_via_app_server(database.parent, session_id, desired):
+        return RESULT_UPDATED
+    return compare_and_set_thread_name_in_database(database, session_id, expected, desired)
+
+
+def compare_and_set_thread_name_in_database(
     database: Path,
     session_id: str,
     expected: str,

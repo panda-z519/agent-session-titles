@@ -322,14 +322,23 @@ class SessionTitleTests(unittest.TestCase):
 
         self.assertEqual(output["sessionTitle"], "测试｜会话标题插件｜我自己写的进展")
 
-    def test_instant_title_lifts_protection_after_desktop_auto_name(self) -> None:
+    def test_desktop_auto_name_before_confirmation_does_not_protect(self) -> None:
         session_id = "auto-name"
         self.run_hook("UserPromptSubmit", session_id, prompt="优化会话标题插件")
-        # 桌面端自动命名会被记成自定义标题，触发整名保护
-        protected = self.hook_output(
-            self.run_hook("UserPromptSubmit", session_id, session_title="Optimize title plugin")
+        # 桌面端首轮后自动起名，覆盖了尚未确认的插件标题
+        output = self.hook_output(
+            self.run_hook("UserPromptSubmit", session_id, session_title="今天状态不错")
         )
-        self.assertIn("整名保护", protected["additionalContext"])
+
+        self.assertEqual(output["sessionTitle"], "摸底｜优化会话标题插件｜分析首条请求")
+        self.assertNotIn("整名保护", output["additionalContext"])
+        self.assertIn(str(self.title_path(session_id)), output["additionalContext"])
+        self.assertFalse(self.state(session_id)["whole_name_protected"])
+
+    def test_instant_title_confirms_after_desktop_auto_name(self) -> None:
+        session_id = "auto-name-instant"
+        self.run_hook("UserPromptSubmit", session_id, prompt="优化会话标题插件")
+        self.run_hook("UserPromptSubmit", session_id, session_title="Optimize title plugin")
         instant = "方案｜优化会话标题插件｜列出改进项"
         self.write_title(session_id, instant)
 
@@ -337,8 +346,46 @@ class SessionTitleTests(unittest.TestCase):
             self.run_hook("UserPromptSubmit", session_id, session_title=instant)
         )
 
+        self.assertNotIn("sessionTitle", output)
+        state = self.state(session_id)
+        self.assertFalse(state["whole_name_protected"])
+        self.assertEqual(state["confirmed_parts"], instant.split("｜"))
+
+    def test_protected_name_restored_to_three_parts_resumes_updates(self) -> None:
+        session_id = "restore-parts"
+        self.establish_baseline(session_id, "开发中｜会话标题插件｜建立标题基线")
+        self.run_hook("UserPromptSubmit", session_id, session_title="人工修改的名称")
+        restored = "测试｜会话标题插件｜手动恢复三段"
+
+        output = self.hook_output(
+            self.run_hook("UserPromptSubmit", session_id, session_title=restored)
+        )
+
         self.assertNotIn("整名保护", output["additionalContext"])
-        self.assertFalse(self.state(session_id)["whole_name_protected"])
+        state = self.state(session_id)
+        self.assertFalse(state["whole_name_protected"])
+        self.assertEqual(state["confirmed_parts"], restored.split("｜"))
+        self.assertEqual(state["locked_parts"], [False, True, False])
+        self.write_title(session_id, "已完成｜会话标题插件｜恢复后继续更新")
+        updated = self.hook_output(
+            self.run_hook("UserPromptSubmit", session_id, session_title=restored)
+        )
+        self.assertEqual(updated["sessionTitle"], "已完成｜会话标题插件｜恢复后继续更新")
+
+    def test_protected_name_without_baseline_stays_protected_when_parseable(self) -> None:
+        session_id = "resume-parseable"
+        self.run_hook(
+            "SessionStart", session_id, source="resume", session_title="别处的名称"
+        )
+
+        output = self.hook_output(
+            self.run_hook(
+                "UserPromptSubmit", session_id, session_title="开发中｜旧会话｜来源未确认"
+            )
+        )
+
+        self.assertIn("整名保护", output["additionalContext"])
+        self.assertTrue(self.state(session_id)["whole_name_protected"])
 
     def test_invalid_titles_are_not_applied(self) -> None:
         invalid_titles = (

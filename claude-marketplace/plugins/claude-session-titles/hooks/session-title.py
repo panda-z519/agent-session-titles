@@ -65,6 +65,8 @@ PRIVATE_LOCATION_PATTERN = re.compile(
 MAX_TITLE_LENGTH = 100
 INITIAL_REQUEST_LIMITS = {"zh": 28, "en": 44}
 STATE_VERSION = 2
+# 只有因名称无法解析而触发的保护，才允许在用户改回三段后恢复
+RESTORABLE_PROTECTION_REASONS = {"current_title_unparseable", "legacy_current_unparseable"}
 SESSION_LOCK_TIMEOUT_SECONDS = 2.0
 SESSION_LOCK_RETRY_SECONDS = 0.05
 
@@ -291,6 +293,25 @@ def protect_whole_name(state: dict[str, Any], reason: str) -> None:
     state["applied_sync_pending"] = False
     state["whole_name_protected"] = True
     state["protection_reason"] = reason
+
+
+def resume_restored_title(state: dict[str, Any], current: str, language: str) -> bool:
+    """因名称无法解析而整名保护的会话，用户改回合法三段后恢复自动更新。"""
+    if state["protection_reason"] not in RESTORABLE_PROTECTION_REASONS or not current:
+        return False
+    parts = parse_title(current, language)
+    if parts is None:
+        return False
+    state["whole_name_protected"] = False
+    state["protection_reason"] = None
+    # 用户写的白名单外状态词视为人工锁定
+    state["locked_parts"] = [parts[0] not in VALID_STATUSES[language], True, False]
+    state["confirmed_parts"] = parts.copy()
+    state["effective_parts"] = parts.copy()
+    state["pending_request"] = None
+    state["middle_provisional"] = False
+    state["applied_sync_pending"] = True
+    return True
 
 
 def current_custom_title(payload: dict[str, Any]) -> str:
@@ -528,7 +549,7 @@ def reconcile_current_title(
 ) -> bool:
     """将当前可见标题合并进逐段锁定状态，并返回状态是否变化。"""
     if state["whole_name_protected"]:
-        return False
+        return resume_restored_title(state, current, language)
     confirmed = state["confirmed_parts"]
     pending = state["pending_request"]
     effective = state["effective_parts"]
@@ -541,6 +562,10 @@ def reconcile_current_title(
 
     current_parts = parse_title(current, language)
     if current_parts is None:
+        if confirmed is None and pending is not None:
+            # 首个标题确认前出现的非三段名称通常是桌面端首轮后的自动命名，
+            # 不视为人工改名；保留待应用标题，下次提交时重新输出。
+            return False
         protect_whole_name(state, "current_title_unparseable")
         return True
     if effective is None:

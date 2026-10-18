@@ -1,7 +1,7 @@
 {
   "name": "claude-session-titles",
   "displayName": "会话标题自动更新",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "为本地 Claude Code 会话维护可选中英文的三段式标题。",
   "license": "MIT",
   "author": {

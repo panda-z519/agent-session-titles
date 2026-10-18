@@ -9,7 +9,7 @@ Status | Initial request | Current progress
 Building | Session titles | Add bilingual support
 ```
 
-The initial request stays stable. Status and progress change at meaningful phase transitions. If you manually edit one segment, the plugin preserves that segment while continuing to update the others. Manually chosen status words do not have to match the automatic status list. Worktrees receive a `[worktree]` prefix; sessions without a project do not gain a made-up project name. A title whose source or three-part structure cannot be confirmed is preserved as a whole.
+The initial request stays stable. Status and progress change at meaningful phase transitions. If you manually edit one segment, the plugin preserves that segment while continuing to update the others. Manually chosen status words do not have to match the automatic status list. Worktrees receive a `[worktree]` prefix; sessions without a project do not gain a made-up project name. A title whose source or three-part structure cannot be confirmed is preserved as a whole; a name the Claude Code desktop app generates before the first plugin title is confirmed is not treated as a manual edit.
 
 ## Install with an Agent
 
@@ -68,7 +68,7 @@ The installer copies plugin files to a stable directory under the user's Codex c
 ## Verify the behavior
 
 1. Restart the client and start a **new local session** with a specific request. The Agent should form a three-part title after understanding the request, then update status or progress as the work changes.
-2. Edit one title segment manually and move the work to another phase. Your edited segment should remain intact while unlocked segments continue to update. An unparseable custom title should remain untouched.
+2. Edit one title segment manually and move the work to another phase. Your edited segment should remain intact while unlocked segments continue to update. An unparseable custom title should remain untouched; renaming it back to a valid three-part title resumes automatic updates with the initial request locked.
 3. In Codex, the plugin tries to apply a title after the tool call that writes its title file. `Stop` and the next prompt provide fallback opportunities. Inspect `~/.codex/session-titles/<session-id>.state.json` for `phase`, `last_result`, and segment locks. When the Codex CLI uses the background app-server daemon, the plugin calls `thread/name/set` through its control socket, so an open CLI window refreshes its status-line title immediately. If the daemon is unavailable (for example with `--no-daemon`), the plugin falls back to writing SQLite directly, and an open window shows the new title only after it is reopened or after `/rename`. A database update alone does not prove the desktop sidebar refreshed immediately.
 4. In Claude Code, the first `UserPromptSubmit` can provide a provisional initial title. In the **desktop app**, a `PostToolUse` hook renames the session **immediately** after the Agent writes the title file. In the **CLI**, where that desktop tool does not exist, progress applies on a subsequent `UserPromptSubmit` (the `PostToolUse` hook reports a non-blocking error), subject to [Claude's supported hook output](https://code.claude.com/docs/en/hooks). Inspect `~/.cc-session-titles/<session-id>.txt` and the session state file when troubleshooting.
 

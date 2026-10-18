@@ -11,6 +11,10 @@ Status | Initial request | Current progress
 Building | Session titles | Add bilingual support
 ```
 
+![Session title updating as the conversation progresses in Codex CLI](docs/images/codex-cli-demo.gif)
+
+Codex CLI shown above (Chinese titles): after each turn, the session title in the window title and the bottom status line refreshes immediately.
+
 The initial request stays stable. Status and progress change at meaningful phase transitions. If you manually edit one segment, the plugin preserves that segment while continuing to update the others. Manually chosen status words do not have to match the automatic status list. Titles contain only these three parts: worktree and project-less sessions get no extra prefix or directory name. A title whose source or three-part structure cannot be confirmed is preserved as a whole; a name the Claude Code desktop app generates before the first plugin title is confirmed is not treated as a manual edit.
 
 ## Install with an Agent
